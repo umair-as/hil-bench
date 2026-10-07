@@ -1,0 +1,49 @@
+# Copy to ~/.config/hil-bench/benches.toml (or point HIL_BENCH_CONFIG at it).
+# Host-local: IPs, serial IDs and credential paths never go in a project repo.
+
+default_bench = "rpi5"
+
+[benches.rpi5]
+description = "Raspberry Pi 5 on Tasmota plug"
+
+[benches.rpi5.power]
+type = "tasmota"
+host = "192.0.2.10"                 # plug IP
+creds_file = "~/.config/tasmota"    # TASMOTA_USER= / TASMOTA_PASS= lines
+relay = 1
+off_seconds = 5                     # let the PSU caps drain
+
+[benches.rpi5.serial]
+# Use the stable /dev/serial/by-id path, not ttyACMn.
+port = "/dev/serial/by-id/usb-XXXX-if00"
+baud = 115200
+
+[benches.rpi5.ssh]
+host = ""          # optional; override per run with --host or HIL_TARGET
+port = 22
+timeout = 120
+
+[benches.rpi5.uboot]
+# stop_string = "abc"        # normally auto-detected from the autoboot prompt
+# too_late_patterns = ['\[MYBOOT\]']   # bootcmd output proving autoboot already ran
+
+[benches.rpi5.boot]
+timeout = 180
+# Optional: replace the built-in stage list. Stages must appear in order;
+# optional ones may be silent and are skipped. Example adding a FIT check:
+#
+# [[benches.rpi5.boot.stages]]
+# name = "eeprom"
+# pattern = 'BOOTLOADER|BOOTMODE:'
+# optional = true
+# [[benches.rpi5.boot.stages]]
+# name = "uboot"
+# pattern = 'U-Boot \d{4}\.\d{2}'
+# [[benches.rpi5.boot.stages]]
+# name = "fit-verified"
+# pattern = 'Verifying Hash Integrity.*\+ OK'
+# [[benches.rpi5.boot.stages]]
+# name = "login"
+# pattern = '^(?!Last )\S+ login: '   # console messages can follow on the same line
+#
+# fail_patterns = ['Kernel panic', 'Bad Data Hash']

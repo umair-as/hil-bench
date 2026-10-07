@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""hil - shared hardware-in-the-loop bench control.
+
+Drives a board's power switch and debug UART so any project (or agent) can
+power-cycle a target, capture its boot console, and assert it reached a
+login prompt. Machine-specific values live in ~/.config/hil-bench/benches.toml,
+never in this tool.
+
+    hil power status|on|off|cycle   [-b BENCH]
+    hil boot   [--no-cycle] [--timeout S] [--log-dir DIR] [--json]
+    hil uboot  env|slot A|B|reset-counters|run -c CMD...|shell  [--then boot|stay|reset]
+    hil wait-ssh [--host H] [--timeout S]
+    hil console [--log-dir DIR]
+    hil benches
+
+Exit status: 0 pass, 1 target failed a check, 2 bench/config/infra error,
+3 bench is locked by another run.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shutil
+import socket
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("HIL_BENCH_CONFIG", "~/.config/hil-bench/benches.toml")).expanduser()
+STATE = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "hil-bench"
+
+# Raspberry Pi 5 defaults. Image-specific stages (FIT signature lines, etc.)
+# go in the bench config's [boot] stages instead.
+DEFAULT_STAGES = [
+    {"name": "eeprom", "pattern": r"BOOTLOADER|BOOTMODE:", "optional": True},
+    {"name": "uboot", "pattern": r"U-Boot \d{4}\.\d{2}", "optional": True},
+    {"name": "kernel", "pattern": r"Starting kernel|Booting Linux", "optional": True},
+    {"name": "login", "pattern": r"^(?!Last )\S+ login: "},
+]
+DEFAULT_FAIL = [
+    r"Kernel panic",
+    r"Bad Data Hash",
+    r"Bad hash value",
+    r"Verification failed",
+    r"Synchronous Abort",
+    r"resetting \.\.\.",
+]
+
+
+class BenchError(Exception):
+    """Bench, config or infrastructure problem (exit 2)."""
+
+
+class BenchLocked(Exception):
+    """Another run holds the bench (exit 3)."""
+
+
+# --------------------------------------------------------------------- config
+
+def load_config() -> dict:
+    if not CONFIG.exists():
+        raise BenchError(f"no bench config at {CONFIG} (copy examples/benches.toml.example)")
+    with CONFIG.open("rb") as f:
+        return tomllib.load(f)
+
+
+def get_bench(cfg: dict, name: str | None) -> tuple[str, dict]:
+    benches = cfg.get("benches", {})
+    name = name or os.environ.get("HIL_BENCH") or cfg.get("default_bench")
+    if not name:
+        raise BenchError("no bench selected (-b, HIL_BENCH, or default_bench)")
+    if name not in benches:
+        raise BenchError(f"unknown bench '{name}' (have: {', '.join(benches) or 'none'})")
+    return name, benches[name]
+
+
+@contextlib.contextmanager
+def bench_lock(name: str, what: str):
+    """Exclusive per-bench lock so two projects never cycle the same board."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    path = STATE / f"{name}.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder = os.pread(fd, 256, 0).decode(errors="replace").partition("\n")[0].strip()
+            raise BenchLocked(f"bench '{name}' is busy: {holder or 'unknown holder'}")
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"pid {os.getpid()} ({what}) since {now_iso()}\n".encode(), 0)
+        yield
+    finally:
+        os.close(fd)
+
+
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------- power
+
+class Tasmota:
+    def __init__(self, conf: dict):
+        self.host = conf["host"]
+        self.relay = int(conf.get("relay", 1))
+        self.user, self.password = self._creds(conf)
+
+    @staticmethod
+    def _creds(conf: dict) -> tuple[str, str]:
+        env = {}
+        creds = conf.get("creds_file")
+        if creds:
+            p = Path(creds).expanduser()
+            if not p.exists():
+                raise BenchError(f"creds_file {p} not found")
+            for line in p.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.removeprefix("export ").strip()] = v.strip().strip("'\"")
+        user = os.environ.get("TASMOTA_USER", env.get("TASMOTA_USER", ""))
+        password = os.environ.get("TASMOTA_PASS", env.get("TASMOTA_PASS", ""))
+        return user, password
+
+    def cmd(self, command: str) -> dict:
+        # Credentials go through urllib, never argv, so they stay out of ps/logs.
+        q = {"cmnd": command}
+        if self.user:
+            q |= {"user": self.user, "password": self.password}
+        url = f"http://{self.host}/cm?{urllib.parse.urlencode(q)}"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                body = json.loads(r.read())
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise BenchError(f"tasmota {self.host} unreachable: {getattr(e, 'reason', e)}") from None
+        except json.JSONDecodeError:
+            raise BenchError(f"tasmota {self.host}: non-JSON reply (bad credentials?)") from None
+        if "WARNING" in body:
+            raise BenchError(f"tasmota {self.host}: {body['WARNING']}")
+        return body
+
+    def _state(self, body: dict) -> str:
+        for key in (f"POWER{self.relay}", "POWER"):
+            if key in body:
+                return body[key]
+        raise BenchError(f"tasmota: no relay state in reply {body}")
+
+    def power(self, action: str | None = None) -> str:
+        return self._state(self.cmd(f"Power{self.relay}" + (f" {action}" if action else "")))
+
+    def status(self) -> dict:
+        energy = self.cmd("Status 8").get("StatusSNS", {}).get("ENERGY", {})
+        return {
+            "relay": self.power(),
+            "watts": energy.get("Power"),
+            "volts": energy.get("Voltage"),
+            "amps": energy.get("Current"),
+            "kwh_today": energy.get("Today"),
+        }
+
+
+def make_power(bench: dict):
+    conf = bench.get("power") or {}
+    kind = conf.get("type")
+    if kind == "tasmota":
+        return Tasmota(conf)
+    raise BenchError(f"unsupported power type: {kind!r}")
+
+
+def power_cycle(psu, off_seconds: float) -> float:
+    """Off, wait, on. Returns the monotonic time the relay closed."""
+    psu.power("Off")
+    try:
+        time.sleep(off_seconds)
+    finally:
+        # Never leave the board dark because the host run was interrupted.
+        state = psu.power("On")
+    if state != "ON":
+        raise BenchError(f"relay did not close (state {state})")
+    return time.monotonic()
+
+
+# --------------------------------------------------------------------- serial
+
+def serial_path(bench: dict) -> str:
+    port = (bench.get("serial") or {}).get("port")
+    if not port:
+        raise BenchError("bench has no serial.port")
+    return port
+
+
+def port_holders(port: str) -> list[str]:
+    """Processes with the tty open (tio, the MCP serial server, ...)."""
+    real = os.path.realpath(port)
+    holders = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                if os.path.realpath(f"/proc/{pid}/fd/{fd}") == real:
+                    comm = Path(f"/proc/{pid}/comm").read_text().strip()
+                    holders.append(f"{comm}[{pid}]")
+                    break
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            continue
+    return holders
+
+
+def open_serial(bench: dict):
+    try:
+        import serial  # pyserial
+    except ImportError:
+        raise BenchError("pyserial not installed (python3 -m pip install --user pyserial)") from None
+    port = serial_path(bench)
+    if not os.path.exists(port):
+        raise BenchError(f"serial port {port} not present")
+    holders = port_holders(port)
+    if holders:
+        raise BenchError(f"{port} already open by {', '.join(holders)}; close it first "
+                         "(serial_close for the MCP server, quit tio)")
+    baud = int(bench["serial"].get("baud", 115200))
+    try:
+        return serial.Serial(port, baud, timeout=0.2, exclusive=True)
+    except serial.SerialException as e:
+        raise BenchError(f"cannot open {port}: {e}") from None
+
+
+def log_paths(log_dir: str | None, name: str, kind: str) -> tuple[Path, Path]:
+    d = Path(log_dir).expanduser() if log_dir else STATE / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    stem = f"{name}-{kind}-{dt.datetime.now():%Y%m%d-%H%M%S}"
+    return d / f"{stem}.log", d / f"{stem}.json"
+
+
+# ------------------------------------------------------------------- commands
+
+def cmd_power(args, name, bench) -> int:
+    psu = make_power(bench)
+    if args.action == "status":
+        print(json.dumps(psu.status()))
+        return 0
+    with bench_lock(name, f"power {args.action}"):
+        if args.action == "cycle":
+            off = args.off_seconds or float(bench["power"].get("off_seconds", 5))
+            power_cycle(psu, off)
+            print(json.dumps({"relay": "ON", "cycled_off_seconds": off}))
+        else:
+            print(json.dumps({"relay": psu.power(args.action.capitalize())}))
+    return 0
+
+
+class Console:
+    """UART reader that logs raw bytes and keeps a decoded, searchable buffer."""
+
+    def __init__(self, ser, log, t0: float):
+        self.ser, self.log, self.t0 = ser, log, t0
+        self.buf = ""
+
+    def elapsed(self) -> float:
+        return round(time.monotonic() - self.t0, 2)
+
+    def pump(self) -> str:
+        chunk = self.ser.read(4096)
+        if not chunk:
+            return ""
+        self.log.write(chunk)
+        self.log.flush()
+        text = chunk.decode("latin-1").replace("\r", "")
+        self.buf += text
+        if len(self.buf) > 1 << 20:  # bounded on chatty consoles
+            self.buf = self.buf[-(1 << 16):]
+        return text
+
+    def write(self, data: str) -> None:
+        # Paced: the U-Boot UART has a small RX FIFO and no flow control.
+        raw = data.encode()
+        for i in range(0, len(raw), 8):
+            self.ser.write(raw[i:i + 8])
+            self.ser.flush()
+            time.sleep(0.01)
+
+    def expect(self, rx: re.Pattern, timeout: float, start: int | None = None):
+        """Wait for rx in the buffer from `start` (default: now). Returns match or None."""
+        pos = len(self.buf) if start is None else start
+        deadline = time.monotonic() + timeout
+        while True:
+            m = rx.search(self.buf, min(pos, len(self.buf)))
+            if m:
+                return m
+            if time.monotonic() >= deadline:
+                return None
+            self.pump()
+
+
+def stage_config(bench: dict, timeout: float | None):
+    boot = bench.get("boot") or {}
+    stages = boot.get("stages") or DEFAULT_STAGES
+    compiled = [(s["name"], re.compile(s["pattern"], re.M), bool(s.get("optional"))) for s in stages]
+    fails = [re.compile(p) for p in boot.get("fail_patterns", DEFAULT_FAIL)]
+    return compiled, fails, timeout or float(boot.get("timeout", 180))
+
+
+def watch_stages(con: Console, compiled, fails, timeout: float, result: dict) -> bool:
+    """Match stages in order on the console (including what is already
+    buffered). Optional stages may be silent; required ones decide PASS."""
+    pos = idx = scanned = 0
+    while idx < len(compiled) and time.monotonic() - con.t0 < timeout:
+        # Fail patterns: scan only new text (with overlap for split lines).
+        fail = next((m for f in fails if (m := f.search(con.buf, max(0, scanned - 200)))), None)
+        scanned = len(con.buf)
+        if fail:
+            result["fail_match"] = fail.group(0)
+            break
+        progressed = False
+        for j in range(idx, len(compiled)):
+            sname, rx, optional = compiled[j]
+            m = rx.search(con.buf, min(pos, len(con.buf)))
+            if m:
+                result["missed"] += [compiled[k][0] for k in range(idx, j)]
+                result["stages"][sname] = con.elapsed()
+                pos, idx, progressed = m.end(), j + 1, True
+                break
+            if not optional:
+                break
+        if not progressed:
+            con.pump()
+    result["missed"] += [c[0] for c in compiled[idx:]]
+    required = {c[0] for c in compiled if not c[2]}
+    return result["fail_match"] is None and required <= result["stages"].keys()
+
+
+def print_stages(result: dict) -> None:
+    for sname, t in result["stages"].items():
+        print(f"  {t:7.2f}s  {sname}")
+    for sname in result["missed"]:
+        print(f"     ---   {sname} (not seen)")
+    if result.get("fail_match"):
+        print(f"  FAIL pattern: {result['fail_match']!r}")
+
+
+def start_console(args, name, bench, ser, log) -> Console:
+    ser.reset_input_buffer()
+    if args.no_cycle:
+        return Console(ser, log, time.monotonic())
+    off = float(bench["power"].get("off_seconds", 5))
+    return Console(ser, log, power_cycle(make_power(bench), off))
+
+
+def cmd_boot(args, name, bench) -> int:
+    compiled, fails, timeout = stage_config(bench, args.timeout)
+    log_path, json_path = log_paths(args.log_dir, name, "boot")
+    result = {"bench": name, "started": now_iso(), "log": str(log_path),
+              "cycled": not args.no_cycle, "stages": {}, "missed": [], "fail_match": None}
+
+    with bench_lock(name, "boot"), open_serial(bench) as ser, log_path.open("wb") as log:
+        con = start_console(args, name, bench, ser, log)
+        ok = watch_stages(con, compiled, fails, timeout, result)
+        result["elapsed"] = con.elapsed()
+
+    result["result"] = "PASS" if ok else "FAIL"
+    json_path.write_text(json.dumps(result, indent=2) + "\n")
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print_stages(result)
+        print(f"{result['result']}  {name}  ({result['elapsed']}s)  log: {log_path}")
+    return 0 if ok else 1
+
+
+# ------------------------------------------------------------- U-Boot rescue
+
+# Prompt text names its own stop string on keyed autoboot ("type 'abc' to
+# stop", "Type 'abc' within 3 seconds"); plain autoboot says "Hit any key".
+AUTOBOOT_RX = re.compile(r"[Tt]ype '([^']+)'[^\n]*(?:stop|autoboot)|Hit any key to stop autoboot")
+# Seen before any autoboot prompt => autoboot is not interruptible (e.g. a
+# BOOTDELAY=-2 production lockdown) and the window has passed.
+# Extend per bench with [uboot] too_late_patterns (e.g. a bootcmd's own log tag).
+TOO_LATE_DEFAULT = [r"## Loading kernel", r"Starting kernel", r"Booting Linux"]
+UBOOT_PROMPT = r"(?:U-Boot> |=> )"
+# Commands that can destroy a card or the whole env; need --allow-destructive.
+DESTRUCTIVE_RX = re.compile(
+    r"\b(?:mmc\s+(?:write|erase|swrite|part|partconf|bootbus|rst)|erase|env\s+default|gpt\s+write"
+    r"|fatwrite|ext4write|fatrm|sf\s+(?:erase|write|update)|ums|dfu|fastboot|nand\s+(?:erase|write))\b")
+RAUC_VARS = ["BOOT_ORDER", "BOOT_A_LEFT", "BOOT_B_LEFT", "bootcount", "rauc_slot"]
+
+
+class UbootError(Exception):
+    """The target did not reach / cooperate at the U-Boot shell (exit 1)."""
+
+
+def uboot_interrupt(con: Console, bench: dict, stop: str | None, timeout: float) -> dict:
+    """Catch the autoboot countdown and stop it. Returns what was seen."""
+    conf = bench.get("uboot") or {}
+    too_late = re.compile("|".join(TOO_LATE_DEFAULT + conf.get("too_late_patterns", [])))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        m = AUTOBOOT_RX.search(con.buf)
+        if m:
+            key = stop or conf.get("stop_string") or m.group(1) or " "
+            con.write(key)
+            if not con.expect(re.compile(UBOOT_PROMPT + r"$"), 5, start=m.end()):
+                # Some builds want a newline after a keyed string.
+                con.write("\r")
+                if not con.expect(re.compile(UBOOT_PROMPT + r"$"), 3, start=m.end()):
+                    raise UbootError(f"sent stop string {key!r} but got no U-Boot prompt")
+            return {"autoboot_prompt": m.group(0), "stop_string": key, "at": con.elapsed()}
+        if too_late.search(con.buf):
+            raise UbootError("autoboot was not interruptible (no countdown before kernel load; "
+                             "production BOOTDELAY=-2 lockdown?)")
+        con.pump()
+    raise UbootError(f"no autoboot prompt within {timeout:.0f}s")
+
+
+def uboot_cmd(con: Console, cmd: str, timeout: float = 10) -> dict:
+    """Type a command, verify the echo, then execute it and capture output."""
+    if "\n" in cmd or "\r" in cmd:
+        raise BenchError("one U-Boot command per line")
+    for _attempt in (1, 2):
+        mark = len(con.buf)
+        con.write(cmd)
+        echo_rx = re.compile(re.escape(cmd) + r"$")
+        if con.expect(echo_rx, 3, start=mark):
+            break
+        con.write("\x03")  # Ctrl-C: discard the garbled line, get a fresh prompt
+        con.expect(re.compile(UBOOT_PROMPT + r"$"), 3, start=mark)
+    else:
+        raise UbootError(f"echo mismatch twice for {cmd!r}; not executed")
+    mark = len(con.buf)
+    con.write("\r")
+    m = con.expect(re.compile(UBOOT_PROMPT + r"$"), timeout, start=mark)
+    if not m:
+        raise UbootError(f"no prompt after {cmd!r} within {timeout:.0f}s")
+    out = con.buf[mark:m.start()].strip("\n")
+    return {"cmd": cmd, "output": out}
+
+
+def uboot_rc(con: Console, cmd: str, timeout: float = 10) -> dict:
+    """Run cmd and capture its exit status via hush's $? (None if unsupported)."""
+    r = uboot_cmd(con, cmd, timeout)
+    rc = uboot_cmd(con, "echo HILRC=$?")["output"]
+    m = re.search(r"HILRC=(\d+)", rc)
+    r["rc"] = int(m.group(1)) if m else None
+    return r
+
+
+def rauc_env(con: Console) -> dict:
+    env = {}
+    for var in RAUC_VARS:
+        out = uboot_cmd(con, f"printenv {var}")["output"]
+        m = re.search(rf"^{var}=(.*)$", out, re.M)
+        env[var] = m.group(1).strip() if m else None
+    return env
+
+
+def cmd_uboot(args, name, bench) -> int:
+    if args.action == "slot" and args.slot not in ("A", "B"):
+        raise BenchError("slot must be A or B")
+    if args.action == "run":
+        if not args.commands:
+            raise BenchError("run needs at least one command")
+        bad = [c for c in args.commands if DESTRUCTIVE_RX.search(c)]
+        if bad and not args.allow_destructive:
+            raise BenchError(f"refusing destructive command(s) {bad} without --allow-destructive")
+    then = "console" if args.action == "shell" else args.then
+    attempts = str(args.attempts)
+
+    log_path, json_path = log_paths(args.log_dir, name, "uboot")
+    result = {"bench": name, "started": now_iso(), "log": str(log_path), "action": args.action,
+              "cycled": not args.no_cycle, "commands": [], "then": then,
+              "stages": {}, "missed": [], "fail_match": None}
+    ok = False
+    try:
+        with bench_lock(name, f"uboot {args.action}"), open_serial(bench) as ser, \
+                log_path.open("wb") as log:
+            con = start_console(args, name, bench, ser, log)
+            result["interrupt"] = uboot_interrupt(con, bench, args.stop_string, args.prompt_timeout)
+            result["env_before"] = rauc_env(con)
+
+            if args.action == "slot":
+                other = "B" if args.slot == "A" else "A"
+                steps = [f"setenv BOOT_ORDER {args.slot} {other}",
+                         f"setenv BOOT_A_LEFT {attempts}", f"setenv BOOT_B_LEFT {attempts}", "saveenv"]
+            elif args.action == "reset-counters":
+                steps = [f"setenv BOOT_A_LEFT {attempts}", f"setenv BOOT_B_LEFT {attempts}", "saveenv"]
+            elif args.action == "run":
+                steps = args.commands
+            else:  # env, shell
+                steps = []
+            for c in steps:
+                r = uboot_rc(con, c, timeout=args.cmd_timeout)
+                result["commands"].append(r)
+                if r["rc"] not in (0, None):
+                    raise UbootError(f"{c!r} failed (rc={r['rc']}): {r['output'][-200:]}")
+            if steps and args.action != "run":
+                result["env_after"] = rauc_env(con)
+
+            if then == "boot":
+                compiled, fails, timeout = stage_config(bench, args.timeout)
+                # Stages already passed before the interrupt (eeprom, U-Boot
+                # banner) won't repeat; only judge what follows "boot".
+                compiled = [c for c in compiled if not (c[2] and c[1].search(con.buf))]
+                mark = len(con.buf)
+                con.write("boot\r")
+                con.buf = con.buf[mark:]  # judge only the boot we just started
+                ok = watch_stages(con, compiled, fails, con.elapsed() + timeout, result)
+            elif then == "reset":
+                con.write("reset\r")
+                ok = True
+            else:  # stay / console: leave the board at the U-Boot prompt
+                ok = True
+            result["elapsed"] = con.elapsed()
+    except UbootError as e:
+        result["error"] = str(e)
+        if "interrupt" in result:
+            result["error"] += " -- board left at the U-Boot prompt (hil power cycle to recover)"
+
+    result["result"] = "PASS" if ok else "FAIL"
+    json_path.write_text(json.dumps(result, indent=2) + "\n")
+    if args.json:
+        print(json.dumps(result))
+    else:
+        if "interrupt" in result:
+            i = result["interrupt"]
+            print(f"  {i['at']:7.2f}s  stopped autoboot with {i['stop_string']!r}")
+        for key in ("env_before", "env_after"):
+            if key in result:
+                env = " ".join(f"{k}={v}" for k, v in result[key].items() if v is not None)
+                print(f"  {key}: {env or '(no RAUC vars set)'}")
+        for r in result["commands"]:
+            print(f"  $ {r['cmd']}  [rc={r['rc']}]")
+            for line in r["output"].splitlines():
+                print(f"      {line}")
+        if then == "boot":
+            print_stages(result)
+        if "error" in result:
+            print(f"  ERROR: {result['error']}")
+        print(f"{result['result']}  {name}  uboot {args.action} (then {then})  log: {log_path}")
+
+    if ok and then == "console":
+        return cmd_console(args, name, bench)
+    return 0 if ok else 1
+
+
+def cmd_wait_ssh(args, name, bench) -> int:
+    ssh = bench.get("ssh") or {}
+    host = args.host or os.environ.get("HIL_TARGET") or ssh.get("host")
+    if not host:
+        raise BenchError("no ssh host (--host, HIL_TARGET, or ssh.host)")
+    port = int(ssh.get("port", 22))
+    deadline = time.monotonic() + (args.timeout or float(ssh.get("timeout", 120)))
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2) as s:
+                s.settimeout(3)
+                if s.recv(64).startswith(b"SSH-"):
+                    print(f"ssh up: {host}:{port}")
+                    return 0
+        except OSError:
+            pass
+        time.sleep(2)
+    print(f"ssh not reachable: {host}:{port}", file=sys.stderr)
+    return 1
+
+
+def cmd_console(args, name, bench) -> int:
+    tio = shutil.which("tio")
+    if not tio:
+        raise BenchError("tio not installed")
+    port = serial_path(bench)
+    holders = port_holders(port)
+    if holders:
+        raise BenchError(f"{port} already open by {', '.join(holders)}")
+    log_dir = Path(args.log_dir).expanduser() if args.log_dir else STATE / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    baud = str(bench["serial"].get("baud", 115200))
+    os.execv(tio, [tio, "-b", baud, "--log", "--log-directory", str(log_dir), port])
+
+
+def cmd_benches(args, cfg) -> int:
+    default = cfg.get("default_bench")
+    for n, b in cfg.get("benches", {}).items():
+        mark = "*" if n == default else " "
+        print(f"{mark} {n:12} {b.get('description', '')}  [{serial_path(b)}]")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="hil", description=__doc__.split("\n\n")[0])
+    ap.add_argument("-b", "--bench", help="bench name (default: HIL_BENCH or default_bench)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("power", help="relay control and energy reading")
+    p.add_argument("action", choices=["status", "on", "off", "cycle"])
+    p.add_argument("--off-seconds", type=float)
+
+    p = sub.add_parser("boot", help="(power-cycle and) assert boot stages on the UART")
+    p.add_argument("--no-cycle", action="store_true", help="watch a boot you trigger yourself")
+    p.add_argument("--timeout", type=float)
+    p.add_argument("--log-dir")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("uboot", help="stop autoboot and inspect/repair the U-Boot env")
+    p.add_argument("action", choices=["env", "slot", "reset-counters", "run", "shell"])
+    p.add_argument("slot", nargs="?", help="A or B (for 'slot')")
+    p.add_argument("-c", "--cmd", dest="commands", action="append", default=[],
+                   help="U-Boot command for 'run' (repeatable, executed in order)")
+    p.add_argument("--then", choices=["boot", "stay", "reset"], default="boot",
+                   help="after the action: boot and watch to login (default), stay at the prompt, or reset")
+    p.add_argument("--attempts", type=int, default=3, help="BOOT_x_LEFT value for slot/reset-counters")
+    p.add_argument("--stop-string", help="override the autoboot stop string (auto-detected from the prompt)")
+    p.add_argument("--allow-destructive", action="store_true", help="permit erase/write/env-default commands")
+    p.add_argument("--no-cycle", action="store_true", help="catch a reset you trigger yourself")
+    p.add_argument("--prompt-timeout", type=float, default=60, help="seconds to wait for the autoboot prompt")
+    p.add_argument("--cmd-timeout", type=float, default=15)
+    p.add_argument("--timeout", type=float, help="boot-to-login timeout when --then boot")
+    p.add_argument("--log-dir")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("wait-ssh", help="wait until the target's sshd answers")
+    p.add_argument("--host")
+    p.add_argument("--timeout", type=float)
+
+    p = sub.add_parser("console", help="interactive tio session with logging")
+    p.add_argument("--log-dir")
+
+    sub.add_parser("benches", help="list configured benches")
+
+    args = ap.parse_args()
+    try:
+        cfg = load_config()
+        if args.cmd == "benches":
+            return cmd_benches(args, cfg)
+        name, bench = get_bench(cfg, args.bench)
+        return {"power": cmd_power, "boot": cmd_boot, "uboot": cmd_uboot, "wait-ssh": cmd_wait_ssh,
+                "console": cmd_console}[args.cmd](args, name, bench)
+    except BenchLocked as e:
+        print(f"hil: {e}", file=sys.stderr)
+        return 3
+    except BenchError as e:
+        print(f"hil: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
