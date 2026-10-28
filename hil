@@ -6,8 +6,9 @@ power-cycle a target, capture its boot console, and assert it reached a
 login prompt. Machine-specific values live in ~/.config/hil-bench/benches.toml,
 never in this tool.
 
-    hil power status|on|off|cycle   [-b BENCH]
-    hil boot   [--no-cycle] [--timeout S] [--log-dir DIR] [--json]
+    hil [-b BENCH] power status|on|off|cycle
+    hil power watch [--interval S] [--duration S] [--csv FILE]
+    hil boot   [--no-cycle] [--repeat N] [--power-interval S] [--timeout S] [--log-dir DIR] [--json]
     hil uboot  env|slot A|B|reset-counters|run -c CMD...|shell  [--then boot|stay|reset]
     hil wait-ssh [--host H] [--timeout S]
     hil console [--log-dir DIR]
@@ -23,12 +24,16 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import http.client
 import json
+import math
 import os
 import re
 import shutil
 import socket
+import statistics
 import sys
+import threading
 import time
 import tomllib
 import urllib.error
@@ -39,22 +44,14 @@ from pathlib import Path
 CONFIG = Path(os.environ.get("HIL_BENCH_CONFIG", "~/.config/hil-bench/benches.toml")).expanduser()
 STATE = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "hil-bench"
 
-# Raspberry Pi 5 defaults. Image-specific stages (FIT signature lines, etc.)
-# go in the bench config's [boot] stages instead.
+# Board-agnostic defaults: anything Linux prints whatever boots it.
+# Bootloader stages (EEPROM, U-Boot, UEFI) and image checks (FIT signatures)
+# belong in the bench config's [boot] stages / fail_patterns.
 DEFAULT_STAGES = [
-    {"name": "eeprom", "pattern": r"BOOTLOADER|BOOTMODE:", "optional": True},
-    {"name": "uboot", "pattern": r"U-Boot \d{4}\.\d{2}", "optional": True},
-    {"name": "kernel", "pattern": r"Starting kernel|Booting Linux", "optional": True},
+    {"name": "kernel", "pattern": r"Booting Linux", "optional": True},
     {"name": "login", "pattern": r"^(?!Last )\S+ login: "},
 ]
-DEFAULT_FAIL = [
-    r"Kernel panic",
-    r"Bad Data Hash",
-    r"Bad hash value",
-    r"Verification failed",
-    r"Synchronous Abort",
-    r"resetting \.\.\.",
-]
+DEFAULT_FAIL = [r"Kernel panic"]
 
 
 class BenchError(Exception):
@@ -141,7 +138,7 @@ class Tasmota:
         try:
             with urllib.request.urlopen(url, timeout=5) as r:
                 body = json.loads(r.read())
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as e:
             raise BenchError(f"tasmota {self.host} unreachable: {getattr(e, 'reason', e)}") from None
         except json.JSONDecodeError:
             raise BenchError(f"tasmota {self.host}: non-JSON reply (bad credentials?)") from None
@@ -158,15 +155,13 @@ class Tasmota:
     def power(self, action: str | None = None) -> str:
         return self._state(self.cmd(f"Power{self.relay}" + (f" {action}" if action else "")))
 
+    def energy(self) -> dict:
+        e = self.cmd("Status 8").get("StatusSNS", {}).get("ENERGY", {})
+        return {"watts": e.get("Power"), "volts": e.get("Voltage"), "amps": e.get("Current"),
+                "kwh_today": e.get("Today")}
+
     def status(self) -> dict:
-        energy = self.cmd("Status 8").get("StatusSNS", {}).get("ENERGY", {})
-        return {
-            "relay": self.power(),
-            "watts": energy.get("Power"),
-            "volts": energy.get("Voltage"),
-            "amps": energy.get("Current"),
-            "kwh_today": energy.get("Today"),
-        }
+        return {"relay": self.power()} | self.energy()
 
 
 def make_power(bench: dict):
@@ -177,17 +172,78 @@ def make_power(bench: dict):
     raise BenchError(f"unsupported power type: {kind!r}")
 
 
-def power_cycle(psu, off_seconds: float) -> float:
-    """Off, wait, on. Returns the monotonic time the relay closed."""
+def power_cycle(psu, off_seconds: float, while_off=None) -> float:
+    """Off, wait, on. Returns the monotonic time the relay closed.
+    while_off runs with the relay open (e.g. to drop the old run's UART bytes)."""
     psu.power("Off")
     try:
         time.sleep(off_seconds)
+        if while_off:
+            while_off()
     finally:
         # Never leave the board dark because the host run was interrupted.
         state = psu.power("On")
     if state != "ON":
         raise BenchError(f"relay did not close (state {state})")
     return time.monotonic()
+
+
+# The plug's meter refreshes about once a second and is only as good as its
+# calibration (see docs/nous-a8t.md); treat watts as indicative, not lab data.
+
+def power_summary(samples: list[dict]) -> dict:
+    """avg/min/max watts and trapezoid-integrated Wh over [{"t", "watts"}, ...]."""
+    pts = [(s["t"], s["watts"]) for s in samples if s.get("watts") is not None]
+    if not pts:
+        return {"samples": 0}
+    w = [p[1] for p in pts]
+    joules = sum((t2 - t1) * (w1 + w2) / 2 for (t1, w1), (t2, w2) in zip(pts, pts[1:]))
+    span = pts[-1][0] - pts[0][0]
+    # Time-weighted, so it agrees with wh even when the sample spacing drifts.
+    avg = joules / span if span > 0 else statistics.fmean(w)
+    return {"samples": len(pts), "avg_w": round(avg, 2), "min_w": min(w),
+            "max_w": max(w), "wh": round(joules / 3600, 4), "span_s": round(span, 2)}
+
+
+def check_interval(x: float | None, flag: str) -> None:
+    if x is not None and not (math.isfinite(x) and x > 0):
+        raise BenchError(f"{flag} must be a positive number of seconds")
+
+
+class PowerSampler:
+    """Polls the plug's meter in a thread, timed from t0 (relay close)."""
+
+    def __init__(self, psu, interval: float, t0: float):
+        self.psu, self.interval, self.t0 = psu, interval, t0
+        self.samples: list[dict] = []
+        self.error: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            tick = time.monotonic()
+            try:
+                e = self.psu.energy()
+            except Exception as err:  # a dropped reading must not fail the boot
+                self.error = f"{type(err).__name__}: {err}"
+            else:
+                self.samples.append({"t": round(time.monotonic() - self.t0, 2), "watts": e["watts"]})
+            self._stop.wait(max(0.0, self.interval - (time.monotonic() - tick)))
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=10)
+        if self._thread.is_alive():
+            self.error = "sampler still blocked on the plug after 10 s"
+
+    def summary(self) -> dict:
+        s = power_summary(self.samples) | {"interval_s": self.interval}
+        return s | ({"error": self.error} if self.error else {})
 
 
 # --------------------------------------------------------------------- serial
@@ -248,6 +304,8 @@ def cmd_power(args, name, bench) -> int:
     if args.action == "status":
         print(json.dumps(psu.status()))
         return 0
+    if args.action == "watch":
+        return power_watch(args, psu)
     with bench_lock(name, f"power {args.action}"):
         if args.action == "cycle":
             off = args.off_seconds or float(bench["power"].get("off_seconds", 5))
@@ -255,6 +313,43 @@ def cmd_power(args, name, bench) -> int:
             print(json.dumps({"relay": "ON", "cycled_off_seconds": off}))
         else:
             print(json.dumps({"relay": psu.power(args.action.capitalize())}))
+    return 0
+
+
+def power_watch(args, psu) -> int:
+    """Sample W/V/A until --duration or Ctrl-C, then summarize. Read-only: no lock."""
+    check_interval(args.interval, "--interval")
+    check_interval(args.duration, "--duration")
+    try:
+        csv = Path(args.csv).expanduser().open("w") if args.csv else None
+    except OSError as e:
+        raise BenchError(f"cannot write --csv: {e}") from None
+    if csv:
+        csv.write("t_s,watts,volts,amps\n")
+    samples, errors, t0 = [], 0, time.monotonic()
+    try:
+        while args.duration is None or time.monotonic() - t0 <= args.duration:
+            tick = time.monotonic()
+            try:
+                s = {"t": round(tick - t0, 2)} | psu.energy()
+            except BenchError as e:  # keep sampling; one dropped reading isn't fatal
+                errors += 1
+                print(f"hil: {e}", file=sys.stderr)
+            else:
+                samples.append(s)
+                line = ",".join("" if v is None else str(v)
+                                for v in (s["t"], s["watts"], s["volts"], s["amps"]))
+                print(line, flush=True)
+                if csv:
+                    csv.write(line + "\n")
+                    csv.flush()
+            time.sleep(max(0.0, args.interval - (time.monotonic() - tick)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if csv:
+            csv.close()
+    print(json.dumps(power_summary(samples) | ({"errors": errors} if errors else {})))
     return 0
 
 
@@ -339,41 +434,120 @@ def watch_stages(con: Console, compiled, fails, timeout: float, result: dict) ->
 
 
 def print_stages(result: dict) -> None:
+    prev = 0.0
     for sname, t in result["stages"].items():
-        print(f"  {t:7.2f}s  {sname}")
+        print(f"  {t:7.2f}s  (+{t - prev:6.2f}s)  {sname}")
+        prev = t
     for sname in result["missed"]:
         print(f"     ---   {sname} (not seen)")
+    if result.get("power"):
+        p = result["power"]
+        if p.get("samples"):
+            print(f"  power: avg {p['avg_w']} W, peak {p['max_w']} W, {p['wh']} Wh over {p['span_s']}s "
+                  f"({p['samples']} samples)")
+        if p.get("error"):
+            print(f"  power: sampling error: {p['error']}")
     if result.get("fail_match"):
         print(f"  FAIL pattern: {result['fail_match']!r}")
 
 
 def start_console(args, name, bench, ser, log) -> Console:
-    ser.reset_input_buffer()
     if args.no_cycle:
+        ser.reset_input_buffer()
         return Console(ser, log, time.monotonic())
     off = float(bench["power"].get("off_seconds", 5))
-    return Console(ser, log, power_cycle(make_power(bench), off))
+    # Clear while the relay is open, so the previous run's tail can't leak in.
+    return Console(ser, log, power_cycle(make_power(bench), off, ser.reset_input_buffer))
+
+
+def boot_once(args, name, bench, ser, compiled, fails, timeout, kind: str) -> dict:
+    log_path, json_path = log_paths(args.log_dir, name, kind)
+    result = {"bench": name, "started": now_iso(), "log": str(log_path),
+              "cycled": not args.no_cycle, "stages": {}, "missed": [], "fail_match": None}
+    with log_path.open("wb") as log:
+        con = start_console(args, name, bench, ser, log)
+        if args.power_interval:
+            with PowerSampler(make_power(bench), args.power_interval, con.t0) as ps:
+                ok = watch_stages(con, compiled, fails, timeout, result)
+            result["power"] = ps.summary()
+        else:
+            ok = watch_stages(con, compiled, fails, timeout, result)
+        result["elapsed"] = con.elapsed()
+    result["result"] = "PASS" if ok else "FAIL"
+    json_path.write_text(json.dumps(result, indent=2) + "\n")
+    return result
+
+
+def series_stats(runs: list[dict]) -> dict:
+    """Per-stage min/median/max/stdev over the runs that reached each stage."""
+    stats = {}
+    for sname in dict.fromkeys(s for r in runs for s in r["stages"]):
+        ts = [r["stages"][sname] for r in runs if sname in r["stages"]]
+        stats[sname] = {"n": len(ts), "min": min(ts), "median": round(statistics.median(ts), 2),
+                        "max": max(ts), "stdev": round(statistics.stdev(ts), 2) if len(ts) > 1 else 0.0}
+    whs = [r["power"]["wh"] for r in runs if r.get("power", {}).get("samples")]
+    if whs:
+        stats["energy_wh"] = {"n": len(whs), "min": min(whs), "median": round(statistics.median(whs), 4),
+                              "max": max(whs)}
+    return stats
 
 
 def cmd_boot(args, name, bench) -> int:
+    if args.repeat < 1:
+        raise BenchError("--repeat must be >= 1")
+    if args.repeat > 1 and args.no_cycle:
+        raise BenchError("--repeat needs power cycles; drop --no-cycle")
+    check_interval(args.power_interval, "--power-interval")
+    if args.settle < 0 or not math.isfinite(args.settle):
+        raise BenchError("--settle must be >= 0 seconds")
     compiled, fails, timeout = stage_config(bench, args.timeout)
-    log_path, json_path = log_paths(args.log_dir, name, "boot")
-    result = {"bench": name, "started": now_iso(), "log": str(log_path),
-              "cycled": not args.no_cycle, "stages": {}, "missed": [], "fail_match": None}
 
-    with bench_lock(name, "boot"), open_serial(bench) as ser, log_path.open("wb") as log:
-        con = start_console(args, name, bench, ser, log)
-        ok = watch_stages(con, compiled, fails, timeout, result)
-        result["elapsed"] = con.elapsed()
+    runs, aborted, interrupted = [], None, False
+    with bench_lock(name, "boot" if args.repeat == 1 else f"boot x{args.repeat}"), \
+            open_serial(bench) as ser:
+        try:
+            for i in range(args.repeat):
+                kind = "boot" if args.repeat == 1 else f"boot-r{i + 1:02d}"
+                r = boot_once(args, name, bench, ser, compiled, fails, timeout, kind)
+                runs.append(r)
+                if not args.json:
+                    if args.repeat > 1:
+                        print(f"run {i + 1}/{args.repeat}")
+                    print_stages(r)
+                    print(f"{r['result']}  {name}  ({r['elapsed']}s)  log: {r['log']}")
+                if i + 1 < args.repeat:
+                    # Leave the board up, e.g. so an A/B scheme can mark the
+                    # slot good before the next power cut.
+                    time.sleep(args.settle)
+        except (BenchError, KeyboardInterrupt) as e:
+            if args.repeat == 1:
+                raise
+            aborted, interrupted = f"{type(e).__name__}: {e}", isinstance(e, KeyboardInterrupt)
 
-    result["result"] = "PASS" if ok else "FAIL"
-    json_path.write_text(json.dumps(result, indent=2) + "\n")
+    if args.repeat == 1:
+        if args.json:
+            print(json.dumps(runs[0]))
+        return 0 if runs[0]["result"] == "PASS" else 1
+
+    passed = sum(r["result"] == "PASS" for r in runs)
+    series = {"bench": name, "runs": len(runs), "requested": args.repeat, "passed": passed,
+              "settle_s": args.settle, "stats": series_stats(runs), "logs": [r["log"] for r in runs]}
+    if aborted:
+        series["aborted"] = aborted
+    _, json_path = log_paths(args.log_dir, name, "boot-series")
+    json_path.write_text(json.dumps(series, indent=2) + "\n")
+    if aborted:
+        print(f"hil: series aborted after {len(runs)}/{args.repeat} runs: {aborted}", file=sys.stderr)
+        print(f"partial summary: {json_path}", file=sys.stderr)
+        return 130 if interrupted else 2
     if args.json:
-        print(json.dumps(result))
+        print(json.dumps(series))
     else:
-        print_stages(result)
-        print(f"{result['result']}  {name}  ({result['elapsed']}s)  log: {log_path}")
-    return 0 if ok else 1
+        print(f"\n{'stage':16} {'n':>3} {'min':>8} {'median':>8} {'max':>8} {'stdev':>7}")
+        for sname, s in series["stats"].items():
+            print(f"{sname:16} {s['n']:3} {s['min']:8} {s['median']:8} {s['max']:8} {s.get('stdev', ''):>7}")
+        print(f"{passed}/{len(runs)} PASS  {name}  summary: {json_path}")
+    return 0 if passed == len(runs) else 1
 
 
 # ------------------------------------------------------------- U-Boot rescue
@@ -390,7 +564,8 @@ UBOOT_PROMPT = r"(?:U-Boot> |=> )"
 DESTRUCTIVE_RX = re.compile(
     r"\b(?:mmc\s+(?:write|erase|swrite|part|partconf|bootbus|rst)|erase|env\s+default|gpt\s+write"
     r"|fatwrite|ext4write|fatrm|sf\s+(?:erase|write|update)|ums|dfu|fastboot|nand\s+(?:erase|write))\b")
-RAUC_VARS = ["BOOT_ORDER", "BOOT_A_LEFT", "BOOT_B_LEFT", "bootcount", "rauc_slot"]
+# RAUC's U-Boot boot-selection convention; only used when [uboot] ab = "rauc".
+RAUC_VARS = ["BOOT_ORDER", "BOOT_A_LEFT", "BOOT_B_LEFT"]
 
 
 class UbootError(Exception):
@@ -452,9 +627,17 @@ def uboot_rc(con: Console, cmd: str, timeout: float = 10) -> dict:
     return r
 
 
-def rauc_env(con: Console) -> dict:
+def env_vars(bench: dict) -> list[str]:
+    conf = bench.get("uboot") or {}
+    extra = conf.get("env_vars", [])
+    if not (isinstance(extra, list) and all(isinstance(v, str) for v in extra)):
+        raise BenchError("[uboot] env_vars must be a list of variable names")
+    return (RAUC_VARS if conf.get("ab") == "rauc" else []) + extra
+
+
+def read_env(con: Console, names: list[str]) -> dict:
     env = {}
-    for var in RAUC_VARS:
+    for var in names:
         out = uboot_cmd(con, f"printenv {var}")["output"]
         m = re.search(rf"^{var}=(.*)$", out, re.M)
         env[var] = m.group(1).strip() if m else None
@@ -462,6 +645,9 @@ def rauc_env(con: Console) -> dict:
 
 
 def cmd_uboot(args, name, bench) -> int:
+    ab = (bench.get("uboot") or {}).get("ab")
+    if args.action in ("slot", "reset-counters") and ab != "rauc":
+        raise BenchError(f"'{args.action}' needs an A/B scheme: set [benches.{name}.uboot] ab = \"rauc\"")
     if args.action == "slot" and args.slot not in ("A", "B"):
         raise BenchError("slot must be A or B")
     if args.action == "run":
@@ -483,7 +669,8 @@ def cmd_uboot(args, name, bench) -> int:
                 log_path.open("wb") as log:
             con = start_console(args, name, bench, ser, log)
             result["interrupt"] = uboot_interrupt(con, bench, args.stop_string, args.prompt_timeout)
-            result["env_before"] = rauc_env(con)
+            names = env_vars(bench)
+            result["env_before"] = read_env(con, names)
 
             if args.action == "slot":
                 other = "B" if args.slot == "A" else "A"
@@ -493,6 +680,8 @@ def cmd_uboot(args, name, bench) -> int:
                 steps = [f"setenv BOOT_A_LEFT {attempts}", f"setenv BOOT_B_LEFT {attempts}", "saveenv"]
             elif args.action == "run":
                 steps = args.commands
+            elif args.action == "env" and not names:
+                steps = ["printenv"]  # nothing configured to pick out: dump it all
             else:  # env, shell
                 steps = []
             for c in steps:
@@ -500,8 +689,8 @@ def cmd_uboot(args, name, bench) -> int:
                 result["commands"].append(r)
                 if r["rc"] not in (0, None):
                     raise UbootError(f"{c!r} failed (rc={r['rc']}): {r['output'][-200:]}")
-            if steps and args.action != "run":
-                result["env_after"] = rauc_env(con)
+            if args.action in ("slot", "reset-counters"):
+                result["env_after"] = read_env(con, names)
 
             if then == "boot":
                 compiled, fails, timeout = stage_config(bench, args.timeout)
@@ -532,9 +721,9 @@ def cmd_uboot(args, name, bench) -> int:
             i = result["interrupt"]
             print(f"  {i['at']:7.2f}s  stopped autoboot with {i['stop_string']!r}")
         for key in ("env_before", "env_after"):
-            if key in result:
+            if result.get(key):
                 env = " ".join(f"{k}={v}" for k, v in result[key].items() if v is not None)
-                print(f"  {key}: {env or '(no RAUC vars set)'}")
+                print(f"  {key}: {env or '(none of the configured vars set)'}")
         for r in result["commands"]:
             print(f"  $ {r['cmd']}  [rc={r['rc']}]")
             for line in r["output"].splitlines():
@@ -599,11 +788,22 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("power", help="relay control and energy reading")
-    p.add_argument("action", choices=["status", "on", "off", "cycle"])
+    p.add_argument("action", choices=["status", "on", "off", "cycle", "watch"])
     p.add_argument("--off-seconds", type=float)
+    p.add_argument("--interval", type=float, default=1.0, help="watch: seconds between samples")
+    p.add_argument("--duration", type=float, help="watch: stop after S seconds (default: Ctrl-C)")
+    p.add_argument("--csv", help="watch: also write samples to this CSV file")
 
     p = sub.add_parser("boot", help="(power-cycle and) assert boot stages on the UART")
     p.add_argument("--no-cycle", action="store_true", help="watch a boot you trigger yourself")
+    p.add_argument("--repeat", type=int, default=1,
+                   help="boot N times and report per-stage min/median/max/stdev")
+    p.add_argument("--settle", type=float, default=0.0,
+                   help="--repeat: keep the board up S seconds after each run before the next cycle "
+                        "(an A/B bench needs long enough to mark the slot good)")
+    p.add_argument("--power-interval", type=float,
+                   help="sample the plug's meter every S seconds during the boot "
+                        "(avg/peak W and Wh until the stage watch ends)")
     p.add_argument("--timeout", type=float)
     p.add_argument("--log-dir")
     p.add_argument("--json", action="store_true")
@@ -615,7 +815,8 @@ def main() -> int:
                    help="U-Boot command for 'run' (repeatable, executed in order)")
     p.add_argument("--then", choices=["boot", "stay", "reset"], default="boot",
                    help="after the action: boot and watch to login (default), stay at the prompt, or reset")
-    p.add_argument("--attempts", type=int, default=3, help="BOOT_x_LEFT value for slot/reset-counters")
+    p.add_argument("--attempts", type=int, default=3,
+                   help="BOOT_x_LEFT value for slot/reset-counters (ab = \"rauc\" benches)")
     p.add_argument("--stop-string", help="override the autoboot stop string (auto-detected from the prompt)")
     p.add_argument("--allow-destructive", action="store_true", help="permit erase/write/env-default commands")
     p.add_argument("--no-cycle", action="store_true", help="catch a reset you trigger yourself")

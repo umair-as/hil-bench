@@ -26,11 +26,27 @@ timeout = 120
 [benches.rpi5.uboot]
 # stop_string = "abc"        # normally auto-detected from the autoboot prompt
 # too_late_patterns = ['\[MYBOOT\]']   # bootcmd output proving autoboot already ran
+# ab = "rauc"                # enables `hil uboot slot` / `reset-counters`
+# env_vars = ["bootcount", "rauc_slot"]   # extra vars `hil uboot` reads
 
 [benches.rpi5.boot]
 timeout = 180
-# Optional: replace the built-in stage list. Stages must appear in order;
-# optional ones may be silent and are skipped. Example adding a FIT check:
+# The built-in stages are generic Linux ones (optional "Booting Linux", then
+# login:) and the only built-in fail pattern is "Kernel panic". A bench whose
+# boot chain prints more replaces both lists. Stages must appear in order;
+# optional ones may be silent and are skipped. Example for an RPi5 with
+# U-Boot and a signed FIT:
+#
+# fail_patterns = [
+#   'Kernel panic',
+#   'Bad Data Hash',
+#   'Bad hash value',
+#   # Not "Verification failed": a FIT with several trust roots prints it for
+#   # every key that does not match before one verifies ("+ OK").
+#   "Failed to verify (required signature|'any' of the required signature)",
+#   'Synchronous Abort',
+#   'resetting \.\.\.',
+# ]
 #
 # [[benches.rpi5.boot.stages]]
 # name = "eeprom"
@@ -45,5 +61,3 @@ timeout = 180
 # [[benches.rpi5.boot.stages]]
 # name = "login"
 # pattern = '^(?!Last )\S+ login: '   # console messages can follow on the same line
-#
-# fail_patterns = ['Kernel panic', 'Bad Data Hash']

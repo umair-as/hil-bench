@@ -27,7 +27,10 @@ line, so they don't show up in `ps` or in logs.
 | `hil benches` | list configured benches (`*` = default) |
 | `hil power status` | relay state + W / V / A / kWh today (no lock taken) |
 | `hil power on\|off\|cycle [--off-seconds N]` | relay control |
+| `hil power watch [--interval S] [--duration S] [--csv F]` | sample W / V / A until the duration ends or Ctrl-C, then print avg/min/max W and Wh (no lock taken) |
 | `hil boot [--no-cycle] [--timeout S] [--log-dir D] [--json]` | power-cycle, watch the UART, time each boot stage, PASS/FAIL |
+| `hil boot --repeat N [--settle S]` | N cycles in a row (board kept up S s between runs); per-stage min/median/max/stdev, pass count |
+| `hil boot --power-interval S` | also sample the plug every S s during the boot: avg/peak W and Wh up to the last stage |
 | `hil uboot env\|slot A\|B\|reset-counters\|run -c CMD…\|shell` | stop autoboot, inspect/repair the U-Boot env (see below) |
 | `hil wait-ssh [--host H] [--timeout S]` | wait for the sshd banner |
 | `hil console [--log-dir D]` | interactive `tio` with logging |
@@ -50,15 +53,49 @@ hil boot --log-dir ./tio-session-logs \
 `hil boot` matches regexes against the console **in order**, and records the
 time of each match measured from the moment the relay closed. Optional stages
 can be absent (e.g. a quiet kernel console) and are reported as "not seen".
-Required ones decide PASS. Any `fail_patterns` hit (kernel panic, bad FIT
-hash, …) fails the run immediately. Both lists can be overridden per bench in
-the config, e.g. to require the FIT signature line
-(`Verifying Hash Integrity ... sha256,rsa4096:<key>+ OK`).
+Required ones decide PASS. Any `fail_patterns` hit fails the run immediately.
+
+The built-in defaults only assume Linux: an optional `Booting Linux` stage, a
+required `login:` prompt, and `Kernel panic` as the only fail pattern.
+Anything that depends on the bootloader or the image goes in the bench's
+`[boot]` config. That covers EEPROM or U-Boot banners, UEFI stages, FIT
+signature lines such as `Verifying Hash Integrity ... sha256,rsa4096:<key>+ OK`,
+and U-Boot failure messages. See `examples/benches.toml.example` for a U-Boot +
+signed-FIT bench.
 
 Each run writes `<bench>-boot-<timestamp>.log` (raw console bytes) and a
 matching `.json` summary to `--log-dir`, defaulting to
 `~/.local/state/hil-bench/logs/`. Grep raw logs with `grep -a`, because
 consoles emit control bytes.
+
+## Timing and power measurement
+
+Each stage line shows the time since relay close and, in brackets, the gap
+from the previous stage, so the slow step in a boot stands out.
+
+`--repeat N` holds the bench lock for the whole series. Each run gets its own
+`<bench>-boot-rNN-<timestamp>.log/.json`, and the series ends with a
+`<bench>-boot-series-<timestamp>.json` holding per-stage statistics over the
+runs that reached that stage. The exit code is `0` only if every run passed.
+With `--json`, only the series summary is printed. If the bench itself fails
+mid-series (plug unreachable, Ctrl-C), a partial series file with an `aborted`
+field is still written and the exit code is `2` (`130` for Ctrl-C).
+
+`--repeat` cuts power as soon as the last stage matches. On an A/B bench (e.g.
+RAUC) the boot counter is usually only reset when userspace marks the slot
+good, so back-to-back cuts can use up a slot's attempts and switch slots
+mid-series. Give such benches `--settle S`, which keeps the board up S seconds
+after each run, long enough for the mark-good to happen. Adding a stage that
+matches the booted slot also makes a switch visible in the results.
+
+Power numbers come from the plug's meter. It refreshes about once a second
+and is only as accurate as its calibration (see `docs/nous-a8t.md`), so treat
+watts and Wh as indicative and compare runs on the same plug. The first
+second after the relay closes can still show the off-state reading.
+`--power-interval` sampling ends when the stage watch ends (last stage, fail
+pattern, or timeout). A dropped plug reading is reported in the run's `power`
+result but doesn't fail the boot, and `power watch` skips it, prints it to
+stderr and counts it in its summary.
 
 ## U-Boot recovery (`hil uboot`)
 
@@ -69,9 +106,9 @@ itself still runs.
 
 | Action | Does |
 |---|---|
-| `env` | print the RAUC state (`BOOT_ORDER`, `BOOT_A_LEFT`, `BOOT_B_LEFT`, `bootcount`, `rauc_slot`) |
-| `slot A\|B` | `BOOT_ORDER="<slot> <other>"`, both counters to `--attempts` (3), `saveenv` |
-| `reset-counters` | both counters to `--attempts`, `saveenv`, e.g. after an "all slots exhausted" halt |
+| `env` | print the configured variables (below), or the whole `printenv` if none are configured |
+| `slot A\|B` | `ab = "rauc"` only: `BOOT_ORDER="<slot> <other>"`, both counters to `--attempts` (3), `saveenv` |
+| `reset-counters` | `ab = "rauc"` only: both counters to `--attempts`, `saveenv`, e.g. after an "all slots exhausted" halt |
 | `run -c CMD [-c CMD …]` | arbitrary commands in order; stops at the first non-zero `$?` |
 | `shell` | stop autoboot, then hand the prompt to `tio` |
 
@@ -92,11 +129,18 @@ board at the prompt, and `--then reset` resets it.
   `ums`, `dfu`, …) are refused without `--allow-destructive`.
 - If a command fails, the board is left at the U-Boot prompt and the error
   says so; `hil power cycle` or `hil boot` brings it back.
-- Assumes the RAUC U-Boot convention: `BOOT_ORDER` plus `BOOT_<slot>_LEFT`.
+- **A/B scheme is opt-in.** `[benches.X.uboot] ab = "rauc"` enables `slot`
+  and `reset-counters`. These use RAUC's U-Boot convention (`BOOT_ORDER` plus
+  `BOOT_<slot>_LEFT`), and the run reads those variables before and after.
+  `env_vars = [...]` adds more variables to read (e.g. `bootcount`,
+  `rauc_slot`). A bench without `ab` refuses `slot` and `reset-counters`.
+- `hil uboot` only applies to boards that boot through U-Boot. A board with a
+  different bootloader (e.g. UEFI) only uses `power`, `boot`,
+  `wait-ssh` and `console`.
 
 ## Sharing the bench
 
-- **One user at a time.** `power on/off/cycle` and `boot` hold
+- **One user at a time.** `power on/off/cycle`, `boot` and `uboot` hold
   `~/.local/state/hil-bench/<bench>.lock`. A second caller gets exit `3` and
   the holder's pid and command.
 - **One reader on the UART.** A tty has no fan-out, so two readers each get
