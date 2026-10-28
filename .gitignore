@@ -1,2 +1,5 @@
 logs/
 __pycache__/
+
+# Private session notes (TODOs, handoff); never committed.
+scratch/

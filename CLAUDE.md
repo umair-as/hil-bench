@@ -1,0 +1,106 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+`hil` is a single-file Python CLI (no `.py` extension, no package) that
+controls shared hardware-in-the-loop benches. It switches a board's power
+through a Tasmota smart plug, captures its debug UART, checks the boot, and
+measures boot timing and power draw. Board projects call it instead of keeping
+their own copies of the bench details, and this repo must not depend on or
+mention any of them.
+
+Requirements: Python ≥ 3.11 (`tomllib`), `pyserial`, `tio` (for `hil console`).
+
+## Keep the tool board-agnostic
+
+Board-, bootloader- and image-specific values never go in `hil`. They live in
+the host-local `~/.config/hil-bench/benches.toml` (override the path with
+`HIL_BENCH_CONFIG`). `examples/benches.toml.example` is the committed
+template. IPs, serial IDs and credential paths stay out of the repo.
+
+- `DEFAULT_STAGES` / `DEFAULT_FAIL` only assume Linux: an optional
+  `Booting Linux` stage, a required `login:` prompt, and `Kernel panic`.
+  EEPROM/U-Boot/UEFI banners, FIT signature lines and U-Boot error strings go
+  in a bench's `[boot] stages` / `fail_patterns`.
+- `hil uboot` only applies to U-Boot boards. Its A/B commands (`slot`,
+  `reset-counters`) are opt-in with `[uboot] ab = "rauc"` (RAUC's
+  `BOOT_ORDER` + `BOOT_<slot>_LEFT`). Extra variables to read go in
+  `[uboot] env_vars`. A bench whose board doesn't boot through U-Boot only
+  uses `power`/`boot`/`wait-ssh`/`console`.
+- Keep the repo self-contained: no paths to other projects, product or
+  customer names, IPs, serial-adapter IDs or hostnames. Examples use
+  placeholders (`192.0.2.x`, `usb-XXXX`).
+
+## Architecture (all in `hil`)
+
+- **Config → bench:** `load_config` + `get_bench` select a bench from
+  `-b`, `HIL_BENCH`, or `default_bench`. Every `cmd_*` takes `(args, name, bench)`.
+- **Power:** `make_power` dispatches on `power.type`. Only `Tasmota` exists:
+  it uses the HTTP `/cm` API with credentials from `creds_file` or
+  `TASMOTA_USER`/`TASMOTA_PASS`. They go through urllib and never into argv.
+  `power_cycle` always switches the relay back on in a `finally`.
+- **Exclusivity:** `bench_lock` takes a per-bench `flock` on
+  `~/.local/state/hil-bench/<bench>.lock` and writes the holder into it.
+  The file stays after a run and isn't proof that the bench is busy; the
+  flock is. `open_serial` refuses if any process has the tty open
+  (`port_holders` scans `/proc`), because a tty has no fan-out. Close MCP
+  serial sessions and `tio` first.
+- **Console:** logs raw bytes to the log file, keeps a decoded buffer capped
+  at 1 MiB, and paces writes in 8-byte chunks (U-Boot UART has no flow control).
+- **Boot checking:** `stage_config` compiles the bench's stages and fail
+  patterns. `watch_stages` matches stages **in order** (optional ones may be
+  skipped), scans only new text for fail patterns, and records the time of
+  each stage from relay close.
+- **U-Boot recovery:** `uboot_interrupt` detects the autoboot prompt (stop
+  string auto-detected) and treats a kernel load seen before any prompt as a
+  non-interruptible lockdown. `uboot_cmd` types each command, checks its echo
+  before pressing Enter (Ctrl-C and one retry on a mismatch), and
+  `uboot_rc` reads `$?`. `DESTRUCTIVE_RX` blocks erase/write/env-default
+  commands without `--allow-destructive`. `--then boot` re-judges the boot
+  after the repair in the same run.
+- **Measurement:** `Tasmota.energy` reads the meter (`Status 8`).
+  `PowerSampler` polls it in a thread during `boot --power-interval`, timed
+  from relay close. Any exception in a reading is recorded as `error`, never
+  raised, so a flaky plug can't fail a boot. `power_summary` does avg/min/max and trapezoid Wh. `boot --repeat`
+  runs `boot_once` N times under one lock (with `--settle` between runs, for
+  A/B benches whose boot counter needs a mark-good). `series_stats` reduces
+  the runs to per-stage min/median/max/stdev, and a bench error mid-series
+  still writes a partial series file. `power watch` is read-only and
+  takes no lock.
+- **Outputs:** `boot` and `uboot` write `<bench>-<kind>-<ts>.log` (raw) plus a
+  `.json` summary to `--log-dir` or `~/.local/state/hil-bench/logs/`.
+  Grep the raw logs with `grep -a`.
+- **Exit codes:** `0` pass, `1` target failed a check (`UbootError` too),
+  `2` bench/config/infra error (`BenchError`), `3` bench locked (`BenchLocked`).
+
+## Checking changes
+
+There is no test suite or linter. Checks that don't need hardware:
+
+```bash
+python3 -m py_compile hil && ./hil --help >/dev/null
+python3 -c "import tomllib; tomllib.load(open('examples/benches.toml.example','rb'))"
+./hil benches                     # parses the real config
+./hil -b <bench> power status     # read-only, takes no lock
+```
+
+To exercise the stage/fail logic offline, load `hil` as a module with
+`importlib.machinery.SourceFileLoader("hil", "hil")` and run `stage_config` /
+`watch_stages` against saved logs in `~/.local/state/hil-bench/logs/`, using a
+fake console object with `buf`, `t0`, `elapsed()` and `pump()`.
+
+`power on/off/cycle`, `boot` and `uboot` act on real hardware that other
+sessions or agents may be using. Check that nobody holds the bench lock or
+the serial port before running them.
+
+## Docs
+
+- `README.md`: user-facing command reference. Keep its tables in sync with
+  the argparse definitions in `main()`.
+- `docs/nous-a8t.md`: notes on the bench smart plug (Tasmota settings applied,
+  open items, plug features `hil` doesn't use yet).
+
+Commit messages use Conventional Commits with a scope, e.g.
+`feat(hil): …`, `docs(nous-a8t): …`.
