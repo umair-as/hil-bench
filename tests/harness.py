@@ -213,6 +213,18 @@ class FakeUboot:
         return out + self.PROMPT
 
 
+TEST_CONFIG = """
+default_bench = "t"
+[benches.t]
+description = "test bench"
+[benches.t.power]
+type = "tasmota"
+host = "192.0.2.1"
+off_seconds = 0.01
+[benches.t.serial]
+port = "/dev/null-test"
+"""
+
 # ------------------------------------------------------------- test base
 
 class HilTestCase(unittest.TestCase):

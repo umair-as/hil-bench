@@ -69,6 +69,10 @@ template. IPs, serial IDs and credential paths stay out of the repo.
   the runs to per-stage min/median/max/stdev, and a bench error mid-series
   still writes a partial series file. `power watch` is read-only and
   takes no lock.
+- **Action log:** `main()` wraps every state-changing command in
+  `run_recorded`, which appends `start`/`end` JSON lines to
+  `<state>/actions.jsonl` and refuses the command if the start line can't
+  be written.
 - **Outputs:** `boot` and `uboot` write `<bench>-<kind>-<ts>.log` (raw) plus a
   `.json` summary to `--log-dir` or `~/.local/state/hil-bench/logs/`.
   Grep the raw logs with `grep -a`.

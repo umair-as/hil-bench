@@ -154,6 +154,14 @@ again, required or not. `--then stay` leaves the board at the prompt, and
   serial session (`serial_close`) and quit `tio`.
 - If a cycle is interrupted (Ctrl-C), the relay is always switched back on,
   so the board isn't left without power.
+- **Action log.** Every state-changing command (`power on/off/cycle`, `boot`,
+  `uboot`, `console`, `hold`) appends a `start` and an `end` line to
+  `~/.local/state/hil-bench/actions.jsonl`: time, pid, user, bench, the
+  command line, and on `end` the exit code and any error. Refused runs
+  (bench locked, plug unreachable) are logged too. If the start line can't
+  be written, the command doesn't run. `console` and `uboot shell` replace
+  themselves with `tio`, so they only get a `start` line. Read-only
+  commands (`power status/watch`, `benches`, `wait-ssh`) aren't logged.
 
 ## Power-loss behaviour of the plug
 

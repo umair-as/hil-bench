@@ -28,6 +28,7 @@ import http.client
 import json
 import math
 import os
+import pwd
 import re
 import shutil
 import socket
@@ -102,6 +103,65 @@ def bench_lock(name: str, what: str):
 
 def now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------- action log
+# Every state-changing command leaves a "start" and an "end" line in
+# <state>/actions.jsonl, so a power-off at 3 a.m. can be traced afterwards.
+
+def is_recorded(args) -> bool:
+    if args.cmd == "power":
+        return args.action in ("on", "off", "cycle")
+    return args.cmd in ("boot", "uboot", "console", "hold")
+
+
+def current_user() -> str:
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return str(os.getuid())
+
+
+def append_action(record: dict) -> None:
+    path = STATE / "actions.jsonl"
+    line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, line)  # one write per line: O_APPEND keeps lines whole
+        finally:
+            os.close(fd)
+    except OSError as e:
+        raise BenchError(f"cannot write the action log {path}: {e}") from None
+
+
+def run_recorded(name: str, args, fn) -> int:
+    """Run fn() between a start and an end record. No start record, no action."""
+    rec = {"pid": os.getpid(), "user": current_user(), "bench": name, "argv": sys.argv[1:]}
+    append_action({"ts": now_iso(), "event": "start"} | rec)
+    rc, err = None, None
+    try:
+        rc = fn()
+        return rc
+    except BenchLocked as e:
+        rc, err = 3, str(e)
+        raise
+    except BenchError as e:
+        rc, err = 2, str(e)
+        raise
+    except KeyboardInterrupt:
+        rc, err = 130, "interrupted"
+        raise
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        end = {"ts": now_iso(), "event": "end"} | rec | {"rc": rc} | ({"error": err} if err else {})
+        try:
+            append_action(end)
+        except BenchError as e:
+            print(f"hil: warning: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------- power
@@ -897,8 +957,11 @@ def main() -> int:
         if args.cmd == "benches":
             return cmd_benches(args, cfg)
         name, bench = get_bench(cfg, args.bench)
-        return {"power": cmd_power, "boot": cmd_boot, "uboot": cmd_uboot, "wait-ssh": cmd_wait_ssh,
-                "console": cmd_console}[args.cmd](args, name, bench)
+        fn = {"power": cmd_power, "boot": cmd_boot, "uboot": cmd_uboot, "wait-ssh": cmd_wait_ssh,
+              "console": cmd_console}[args.cmd]
+        if is_recorded(args):
+            return run_recorded(name, args, lambda: fn(args, name, bench))
+        return fn(args, name, bench)
     except BenchLocked as e:
         print(f"hil: {e}", file=sys.stderr)
         return 3

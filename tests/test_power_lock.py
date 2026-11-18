@@ -6,7 +6,7 @@ import socket
 import unittest
 import urllib.request
 
-from harness import FakePlug, HilTestCase, hil, ns
+from harness import TEST_CONFIG, FakePlug, HilTestCase, hil, ns
 
 
 class PowerTests(HilTestCase):
@@ -143,16 +143,7 @@ class GuardTests(HilTestCase):
 
 
 class MainTests(HilTestCase):
-    CONFIG = """
-default_bench = "t"
-[benches.t]
-description = "test bench"
-[benches.t.power]
-type = "tasmota"
-host = "192.0.2.1"
-[benches.t.serial]
-port = "/dev/null-test"
-"""
+    CONFIG = TEST_CONFIG
 
     def test_missing_config_exit_2(self):
         rc, _, err = self.run_main("benches")
