@@ -77,19 +77,23 @@ template. IPs, serial IDs and credential paths stay out of the repo.
 
 ## Checking changes
 
-There is no test suite or linter. Checks that don't need hardware:
+There is no linter. The offline test suite needs no hardware: it loads `hil`
+with `SourceFileLoader`, gives every test a throwaway config and state
+directory, fakes the serial port, the plug and a U-Boot shell
+(`tests/harness.py`), and makes any real network or serial access raise.
+Add a failing test before every fix.
 
 ```bash
+python3 -m unittest discover -s tests
 python3 -m py_compile hil && ./hil --help >/dev/null
 python3 -c "import tomllib; tomllib.load(open('examples/benches.toml.example','rb'))"
 ./hil benches                     # parses the real config
 ./hil -b <bench> power status     # read-only, takes no lock
 ```
 
-To exercise the stage/fail logic offline, load `hil` as a module with
-`importlib.machinery.SourceFileLoader("hil", "hil")` and run `stage_config` /
-`watch_stages` against saved logs in `~/.local/state/hil-bench/logs/`, using a
-fake console object with `buf`, `t0`, `elapsed()` and `pump()`.
+To check the stage/fail logic against a real boot, feed a saved log from
+`~/.local/state/hil-bench/logs/` to a `FakeSerial` from the harness and run
+`stage_config` / `watch_stages` on it.
 
 `power on/off/cycle`, `boot` and `uboot` act on real hardware that other
 sessions or agents may be using. Check that nobody holds the bench lock or
