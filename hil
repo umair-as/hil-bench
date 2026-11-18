@@ -1280,10 +1280,15 @@ def mcp_check_args(tool: dict, args) -> None:
     for key, val in args.items():
         spec = schema["properties"][key]
         kind = spec["type"]
-        ok = {"string": isinstance(val, str),
-              "boolean": isinstance(val, bool),
-              "number": isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val),
-              "array": isinstance(val, list)}[kind]
+        if kind == "number":
+            # Type first: math.isfinite() raises OverflowError on huge JSON ints.
+            try:
+                ok = isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val)
+            except OverflowError:
+                ok = False
+        else:
+            ok = {"string": isinstance(val, str), "boolean": isinstance(val, bool),
+                  "array": isinstance(val, list)}[kind]
         if ok and kind == "string":
             ok = ("enum" not in spec or val in spec["enum"]) and \
                  ("pattern" not in spec or re.match(spec["pattern"], val) is not None)
@@ -1434,6 +1439,9 @@ class McpServer:
                 return {"jsonrpc": "2.0", "id": mid, "result": self.call(params)}
             except McpInvalidParams as e:
                 return self.error(mid, -32602, str(e))
+            except Exception as e:  # one bad request must never stop the server
+                print(f"hil: mcp: internal error: {type(e).__name__}: {e}", file=sys.stderr)
+                return self.error(mid, -32603, "internal error")
         return self.error(mid, -32601, f"method not found: {method}")
 
     def call(self, params) -> dict:

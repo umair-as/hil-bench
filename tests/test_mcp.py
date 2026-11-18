@@ -156,6 +156,19 @@ class McpTests(HilTestCase):
         self.assertFalse(self.thread.is_alive())
         self.assertFalse(self.sock_path.exists())
 
+    def test_huge_number_is_invalid_params_not_a_crash(self):
+        res = self.rpc("tools/call", {"name": "boot", "arguments": {"timeout": 10 ** 400}})
+        self.assertEqual(res["error"]["code"], -32602)
+        self.assertEqual(self.rpc("ping")["result"], {})  # still serving
+
+    def test_unexpected_error_in_a_call_is_internal_error_not_a_crash(self):
+        from unittest import mock
+        with mock.patch.object(hil, "mcp_argv", side_effect=RuntimeError("boom")):
+            res = self.rpc("tools/call", {"name": "benches", "arguments": {}})
+        self.assertEqual(res["error"]["code"], -32603)
+        self.assertNotIn("boom", res["error"]["message"])  # no internals to the client
+        self.assertEqual(self.rpc("ping")["result"], {})
+
     def test_parse_error_and_unknown_method(self):
         self.f.write(b"{not json\n")
         self.f.flush()
