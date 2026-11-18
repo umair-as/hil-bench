@@ -143,7 +143,8 @@ the serial port before running them.
 - `docs/bench-lock.md`: the lock protocol other tools follow. Keep it in
   sync with `bench_lock`, `inherited_lock` and `flock_holders`.
 - `docs/nous-a8t.md`: notes on the bench smart plug (Tasmota settings applied,
-  open items, plug features `hil` doesn't use yet).
+  open items, the plug features `hil` uses and the Backlog/Delay finding,
+  features it doesn't use yet).
 
 Commit messages use Conventional Commits with a scope, e.g.
 `feat(hil): …`, `docs(nous-a8t): …`.
