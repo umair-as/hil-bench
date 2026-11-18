@@ -51,7 +51,9 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 CONFIG = Path(os.environ.get("HIL_BENCH_CONFIG", "~/.config/hil-bench/benches.toml")).expanduser()
 STATE = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "hil-bench"
@@ -751,7 +753,40 @@ class Console:
             self.pump()
 
 
-def stage_config(bench: dict, timeout: float | None):
+class Stage(NamedTuple):
+    name: str
+    rx: re.Pattern
+    optional: bool
+
+
+class StageConfig(NamedTuple):
+    """A bench's boot check: stages in order, fail patterns, timeout (s)."""
+    stages: list[Stage]
+    fails: list[re.Pattern]
+    timeout: float
+
+    @property
+    def required(self) -> set[str]:
+        return {st.name for st in self.stages if not st.optional}
+
+
+@dataclass
+class StageResult:
+    """What a stage watch saw: stage name -> seconds from relay close, the
+    stages not seen, and the fail pattern match that ended it, if any."""
+    stages: dict[str, float] = field(default_factory=dict)
+    missed: list[str] = field(default_factory=list)
+    fail_match: str | None = None
+
+    def passed(self, check: StageConfig) -> bool:
+        return self.fail_match is None and check.required <= self.stages.keys()
+
+    def as_json(self) -> dict:
+        """The keys boot and uboot JSON summaries carry (a stable contract)."""
+        return {"stages": self.stages, "missed": self.missed, "fail_match": self.fail_match}
+
+
+def stage_config(bench: dict, timeout: float | None) -> StageConfig:
     boot = bench.get("boot") or {}
     stages = boot.get("stages") or DEFAULT_STAGES
     if not isinstance(stages, list):
@@ -761,55 +796,64 @@ def stage_config(bench: dict, timeout: float | None):
         if not (isinstance(st, dict) and isinstance(st.get("name"), str) and isinstance(st.get("pattern"), str)):
             raise BenchError(f"[boot] stages[{i}] needs a name and a pattern")
         (rx,) = compile_patterns([st["pattern"]], f"[boot] stages[{i}] ({st['name']}) pattern")
-        compiled.append((st["name"], rx, bool(st.get("optional"))))
+        compiled.append(Stage(st["name"], rx, bool(st.get("optional"))))
     # re.M for both lists, so ^ and $ mean line start/end everywhere.
     fails = compile_patterns(boot.get("fail_patterns", DEFAULT_FAIL), "[boot] fail_patterns")
     if timeout is None:
         timeout = conf_number(boot, "timeout", 180, "[boot]")
-    return compiled, fails, timeout
+    return StageConfig(compiled, fails, timeout)
 
 
-def watch_stages(con: Console, compiled, fails, timeout: float, result: dict) -> bool:
+# Fail patterns are re-scanned from this many characters before the last
+# scan, so a match split across two reads is still found.
+FAIL_SCAN_OVERLAP = 200
+
+
+def watch_stages(con: Console, check: StageConfig, timeout: float | None = None,
+                 into: StageResult | None = None) -> StageResult:
     """Match stages in order on the console (including what is already
-    buffered). Optional stages may be silent; required ones decide PASS."""
+    buffered). Optional stages may be silent; required ones decide PASS
+    (`result.passed(check)`). Fills `into` as it goes, so a caller that
+    catches an error mid-watch still has the stages reached so far."""
+    result = into if into is not None else StageResult()
+    stages, deadline = check.stages, check.timeout if timeout is None else timeout
     pos = idx = scanned = 0  # absolute offsets (see Console)
-    while idx < len(compiled) and time.monotonic() - con.t0 < timeout:
+    while idx < len(stages) and time.monotonic() - con.t0 < deadline:
         # Fail patterns: scan only new text (with overlap for split lines).
-        fail = next((m for f in fails if (m := f.search(con.buf, con.local(scanned - 200)))), None)
+        start = con.local(scanned - FAIL_SCAN_OVERLAP)
+        fail = next((m for f in check.fails if (m := f.search(con.buf, start))), None)
         scanned = con.mark()
         if fail:
-            result["fail_match"] = fail.group(0)
+            result.fail_match = fail.group(0)
             break
         progressed = False
-        for j in range(idx, len(compiled)):
-            sname, rx, optional = compiled[j]
-            m = rx.search(con.buf, con.local(pos))
+        for j in range(idx, len(stages)):
+            m = stages[j].rx.search(con.buf, con.local(pos))
             if m:
-                result["missed"] += [compiled[k][0] for k in range(idx, j)]
-                result["stages"][sname] = con.elapsed()
+                result.missed += [st.name for st in stages[idx:j]]
+                result.stages[stages[j].name] = con.elapsed()
                 pos, idx, progressed = con.base + m.end(), j + 1, True
                 break
-            if not optional:
+            if not stages[j].optional:
                 break
         if not progressed:
             con.pump()
-    result["missed"] += [c[0] for c in compiled[idx:]]
-    required = {c[0] for c in compiled if not c[2]}
-    return result["fail_match"] is None and required <= result["stages"].keys()
+    result.missed += [st.name for st in stages[idx:]]
+    return result
 
 
-def stages_already_seen(compiled, text: str) -> list[str]:
+def stages_already_seen(stages: list[Stage], text: str) -> list[str]:
     """Names of the stages that `text` already shows, walked in order the way
     watch_stages does: an optional stage may be absent, a missing required
     one ends the run. Used for the part of a boot printed before an
     autoboot interrupt, which won't repeat after `boot`."""
     seen, pos = [], 0
-    for sname, rx, optional in compiled:
-        m = rx.search(text, pos)
+    for st in stages:
+        m = st.rx.search(text, pos)
         if m:
-            seen.append(sname)
+            seen.append(st.name)
             pos = m.end()
-        elif not optional:
+        elif not st.optional:
             break
     return seen
 
@@ -843,26 +887,29 @@ def start_console(args, name, bench, ser, log) -> Console:
     return Console(ser, log, power_cycle(make_power(bench), off, ser.reset_input_buffer))
 
 
-def boot_once(args, name, bench, ser, compiled, fails, timeout, kind: str) -> dict:
+def boot_once(args, name, bench, ser, check: StageConfig, kind: str) -> dict:
     log_path, json_path = log_paths(args.log_dir, name, kind)
+    sr = StageResult()
     result = {"bench": name, "started": now_iso(), "log": str(log_path),
-              "cycled": not args.no_cycle, "stages": {}, "missed": [], "fail_match": None}
+              "cycled": not args.no_cycle} | sr.as_json()
     try:
         with log_path.open("wb") as log:
             con = start_console(args, name, bench, ser, log)
             if args.power_interval:
                 with PowerSampler(make_power(bench), args.power_interval, con.t0) as ps:
-                    ok = watch_stages(con, compiled, fails, timeout, result)
+                    watch_stages(con, check, into=sr)
                 result["power"] = ps.summary()
             else:
-                ok = watch_stages(con, compiled, fails, timeout, result)
+                watch_stages(con, check, into=sr)
             result["elapsed"] = con.elapsed()
     except BenchError as e:
-        # Bench/infra failure (plug, port): still leave a record of the run.
-        result |= {"error": str(e), "result": "ERROR"}
+        # Bench/infra failure (plug, port): still leave a record of the run,
+        # including the stages reached before it.
+        result |= sr.as_json() | {"error": str(e), "result": "ERROR"}
         json_path.write_text(json.dumps(result, indent=2) + "\n")
         raise
-    result["result"] = "PASS" if ok else "FAIL"
+    result |= sr.as_json()
+    result["result"] = "PASS" if sr.passed(check) else "FAIL"
     json_path.write_text(json.dumps(result, indent=2) + "\n")
     return result
 
@@ -890,7 +937,7 @@ def cmd_boot(args, name, bench) -> int:
     check_interval(args.timeout, "--timeout")
     if args.settle < 0 or not math.isfinite(args.settle):
         raise BenchError("--settle must be >= 0 seconds")
-    compiled, fails, timeout = stage_config(bench, args.timeout)
+    check = stage_config(bench, args.timeout)
 
     runs, aborted, interrupted = [], None, False
     with bench_lock(name, "boot" if args.repeat == 1 else f"boot x{args.repeat}"), \
@@ -898,7 +945,7 @@ def cmd_boot(args, name, bench) -> int:
         try:
             for i in range(args.repeat):
                 kind = "boot" if args.repeat == 1 else f"boot-r{i + 1:02d}"
-                r = boot_once(args, name, bench, ser, compiled, fails, timeout, kind)
+                r = boot_once(args, name, bench, ser, check, kind)
                 runs.append(r)
                 if not args.json:
                     if args.repeat > 1:
@@ -1114,8 +1161,8 @@ def cmd_uboot(args, name, bench) -> int:
 
     log_path, json_path = log_paths(args.log_dir, name, "uboot")
     result = {"bench": name, "started": now_iso(), "log": str(log_path), "action": args.action,
-              "cycled": not args.no_cycle, "commands": [], "then": then,
-              "stages": {}, "missed": [], "fail_match": None}
+              "cycled": not args.no_cycle, "commands": [], "then": then} | StageResult().as_json()
+    sr = StageResult()  # filled by a --then boot watch; merged on every exit path
     ok = False
     try:
         with bench_lock(name, f"uboot {args.action}"), open_serial(bench) as ser, \
@@ -1146,16 +1193,17 @@ def cmd_uboot(args, name, bench) -> int:
                 result["env_after"] = read_env(con, names)
 
             if then == "boot":
-                compiled, fails, timeout = stage_config(bench, args.timeout)
+                check = stage_config(bench, args.timeout)
                 # Stages already passed before the interrupt (eeprom, U-Boot
                 # banner) won't repeat, required or not; judge only the rest.
-                seen = stages_already_seen(compiled, con.buf)
+                seen = stages_already_seen(check.stages, con.buf)
                 result["before_interrupt"] = seen
-                compiled = [c for c in compiled if c[0] not in seen]
+                check = check._replace(stages=[st for st in check.stages if st.name not in seen])
                 mark = con.mark()
                 con.write("boot\r")
                 con.drop_before(mark)  # judge only the boot we just started
-                ok = watch_stages(con, compiled, fails, con.elapsed() + timeout, result)
+                watch_stages(con, check, timeout=con.elapsed() + check.timeout, into=sr)
+                ok = sr.passed(check)
             elif then == "reset":
                 con.write("reset\r")
                 ok = True
@@ -1168,12 +1216,13 @@ def cmd_uboot(args, name, bench) -> int:
             result["error"] += " -- board left at the U-Boot prompt (hil power cycle to recover)"
     except BenchError as e:
         # Bench/infra failure (plug, port): still leave a record of the run.
-        result |= {"error": str(e), "result": "ERROR"}
+        result |= sr.as_json() | {"error": str(e), "result": "ERROR"}
         if not log_path.exists():
             result["log"] = None
         json_path.write_text(json.dumps(result, indent=2) + "\n")
         raise
 
+    result |= sr.as_json()
     result["result"] = "PASS" if ok else "FAIL"
     json_path.write_text(json.dumps(result, indent=2) + "\n")
     if args.json:

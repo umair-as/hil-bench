@@ -12,17 +12,11 @@ LINUX_BOOT = ("U-Boot 2024.01\n"
               "board login: ")
 
 
-def result():
-    return {"stages": {}, "missed": [], "fail_match": None}
-
-
 class StageTests(HilTestCase):
     def watch(self, output, bench=None, timeout=0.5, chunk=4096):
-        compiled, fails, _ = hil.stage_config(bench or {}, timeout)
-        con = self.console(FakeSerial(output, chunk=chunk))
-        r = result()
-        ok = hil.watch_stages(con, compiled, fails, timeout, r)
-        return ok, r
+        check = hil.stage_config(bench or {}, timeout)
+        sr = hil.watch_stages(self.console(FakeSerial(output, chunk=chunk)), check)
+        return sr.passed(check), sr.as_json()
 
     def test_default_stages_pass(self):
         ok, r = self.watch(LINUX_BOOT)
@@ -133,19 +127,17 @@ class BufferTrimTests(HilTestCase):
         noise = ("x" * 99 + "\n") * 9000          # ~900 KB before the kernel line
         tail = ("y" * 99 + "\n") * 2000           # ~200 KB after it
         out = noise + "Booting Linux on CPU 0\n" + tail + "board login: "
-        compiled, fails, _ = hil.stage_config({}, 5)
-        con = self.console(FakeSerial(out))
-        r = result()
-        ok = hil.watch_stages(con, compiled, fails, 5, r)
-        self.assertTrue(ok, r)
-        self.assertEqual(r["missed"], [])
+        check = hil.stage_config({}, 5)
+        sr = hil.watch_stages(self.console(FakeSerial(out)), check)
+        self.assertTrue(sr.passed(check), sr)
+        self.assertEqual(sr.missed, [])
 
     def test_fail_pattern_found_after_buffer_trim(self):
         out = ("x" * 99 + "\n") * 9000 + "Booting Linux\n" + ("y" * 99 + "\n") * 2000 + "Kernel panic\n"
-        compiled, fails, _ = hil.stage_config({}, 5)
-        r = result()
-        self.assertFalse(hil.watch_stages(self.console(FakeSerial(out)), compiled, fails, 5, r))
-        self.assertEqual(r["fail_match"], "Kernel panic")
+        check = hil.stage_config({}, 5)
+        sr = hil.watch_stages(self.console(FakeSerial(out)), check)
+        self.assertFalse(sr.passed(check))
+        self.assertEqual(sr.fail_match, "Kernel panic")
 
     def test_expect_start_survives_trim(self):
         con = self.console(FakeSerial(("z" * 99 + "\n") * 10600 + "MARK\n"))

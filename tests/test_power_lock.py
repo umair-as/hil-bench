@@ -113,7 +113,7 @@ class SmallFixTests(HilTestCase):
         self.assertIn("no serial", out)
 
     def test_fail_patterns_are_multiline_like_stages(self):
-        _, fails, _ = hil.stage_config({"boot": {"fail_patterns": ["^resetting"]}}, 1)
+        fails = hil.stage_config({"boot": {"fail_patterns": ["^resetting"]}}, 1).fails
         self.assertTrue(fails[0].search("U-Boot\nresetting ...\n"))
 
 

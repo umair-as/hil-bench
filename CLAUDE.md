@@ -67,9 +67,12 @@ template. IPs, serial IDs and credential paths stay out of the repo.
 - **Console:** logs raw bytes to the log file, keeps a decoded buffer capped
   at 1 MiB, and paces writes in 8-byte chunks (U-Boot UART has no flow control).
 - **Boot checking:** `stage_config` compiles the bench's stages and fail
-  patterns. `watch_stages` matches stages **in order** (optional ones may be
+  patterns into a `StageConfig` (`Stage` NamedTuples, fail regexes,
+  timeout). `watch_stages` matches stages **in order** (optional ones may be
   skipped), scans only new text for fail patterns, and records the time of
-  each stage from relay close.
+  each stage from relay close in a `StageResult`, which it fills as it goes
+  so an error mid-watch keeps the partial result; `as_json()` gives the
+  `stages`/`missed`/`fail_match` keys of the JSON summaries.
 - **U-Boot recovery:** `uboot_interrupt` detects the autoboot prompt (stop
   string auto-detected) and treats a kernel load seen before any prompt as a
   non-interruptible lockdown. `uboot_cmd` types each command, checks its echo
@@ -132,6 +135,10 @@ python3 -c "import tomllib; tomllib.load(open('examples/benches.toml.example','r
 ./hil benches                     # parses the real config
 ./hil -b <bench> power status     # read-only, takes no lock
 ```
+
+Loading `hil` as a module from a script needs `sys.modules["hil"] = mod`
+before `exec_module` (dataclasses look their module up there); the harness
+does this.
 
 To check the stage/fail logic against a real boot, feed a saved log from
 `~/.local/state/hil-bench/logs/` to a `FakeSerial` from the harness and run

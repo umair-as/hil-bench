@@ -15,6 +15,7 @@ import io
 import os
 import re
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -37,6 +38,7 @@ def load_hil():
     loader = importlib.machinery.SourceFileLoader("hil", str(ROOT / "hil"))
     spec = importlib.util.spec_from_loader("hil", loader)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules["hil"] = mod  # dataclasses look their module up here
     loader.exec_module(mod)
     return mod
 

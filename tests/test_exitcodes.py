@@ -75,6 +75,35 @@ class ExitCodeTests(HilTestCase):
         self.assertEqual(len(js), 1)
         self.assertEqual(json.loads(js[0].read_text())["result"], "ERROR")
 
+    def test_serial_drop_keeps_stages_reached_before_it(self):
+        ser = FakeSerial()
+        reads = {"n": 0}
+        real_read = ser.read
+
+        def read(n):
+            reads["n"] += 1
+            if reads["n"] > 5:
+                raise OSError(5, "device disconnected")
+            return real_read(n)
+        ser.read = read
+        real_power = self.plug.power
+
+        def power(action=None):
+            state = real_power(action)
+            if action == "On":  # the board prints once the relay closes
+                ser.feed("Booting Linux on CPU 0\n")
+            return state
+        self.plug.power = power
+        self.use_fakes(ser, self.plug)
+        self.write_config(TEST_CONFIG)
+        log_dir = self.tmp / "logs"
+        self.assert_rc2("boot", "--timeout", "5", "--log-dir", str(log_dir), says="serial")
+        data = json.loads(next(log_dir.glob("t-boot-*.json")).read_text())
+        self.assertEqual(data["result"], "ERROR")
+        self.assertIn("kernel", data["stages"])
+        self.assertEqual(list(data)[:9], ["bench", "started", "log", "cycled", "stages", "missed",
+                                          "fail_match", "error", "result"])
+
     def test_unexpected_exception_is_exit_2_with_details(self):
         self.write_config(TEST_CONFIG)
         with mock.patch.object(hil, "cmd_power", side_effect=RuntimeError("surprise")):
