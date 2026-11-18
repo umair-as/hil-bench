@@ -663,6 +663,10 @@ def log_paths(log_dir: str | None, name: str, kind: str) -> tuple[Path, Path]:
 
 def cmd_power(args, name, bench) -> int:
     check_interval(args.off_seconds, "--off-seconds")
+    if args.action != "watch":
+        for option in ("interval", "duration", "csv"):
+            if getattr(args, option) is not None:
+                raise BenchError(f"--{option} only applies to power watch")
     if args.max_on is not None:
         if args.action not in ("on", "cycle"):
             raise BenchError("--max-on only applies to power on and power cycle")
@@ -693,7 +697,8 @@ def cmd_power(args, name, bench) -> int:
 
 def power_watch(args, psu) -> int:
     """Sample W/V/A until --duration or Ctrl-C, then summarize. Read-only: no lock."""
-    check_interval(args.interval, "--interval")
+    interval = args.interval if args.interval is not None else 1.0
+    check_interval(interval, "--interval")
     check_interval(args.duration, "--duration")
     samples, errors = [], 0
     with contextlib.ExitStack() as stack:
@@ -721,7 +726,7 @@ def power_watch(args, psu) -> int:
                 if csv:
                     csv.write(line + "\n")
                     csv.flush()
-            time.sleep(max(0.0, args.interval - (time.monotonic() - tick)))
+            time.sleep(max(0.0, interval - (time.monotonic() - tick)))
     print(json.dumps(power_summary(samples) | ({"errors": errors} if errors else {})))
     return 0
 
@@ -1687,7 +1692,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--off-seconds", type=float)
     p.add_argument("--max-on", type=float, metavar="S",
                    help="on/cycle: the plug switches itself off after S s (PulseTime dead-man; 0 clears it)")
-    p.add_argument("--interval", type=float, default=1.0, help="watch: seconds between samples")
+    p.add_argument("--interval", type=float, help="watch: seconds between samples (default: 1)")
     p.add_argument("--duration", type=float, help="watch: stop after S seconds (default: Ctrl-C)")
     p.add_argument("--csv", help="watch: also write samples to this CSV file")
 

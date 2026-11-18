@@ -75,7 +75,7 @@ carries the credentials in the URL query string.
 | `hil benches` | list configured benches (`*` = default) |
 | `hil power status` | relay state + W / V / A / kWh today (no lock taken) |
 | `hil power on\|off\|cycle [--off-seconds N] [--max-on S]` | relay control; `--max-on` arms the plug's own switch-off timer (see "Plug-side safety") |
-| `hil power watch [--interval S] [--duration S] [--csv F]` | sample W / V / A until the duration ends or Ctrl-C, then print avg/min/max W and Wh (no lock taken) |
+| `hil power watch [--interval S] [--duration S] [--csv F]` | sample W / V / A every S seconds (default: 1) until the duration ends or Ctrl-C, then print avg/min/max W and Wh (no lock taken); these options apply only to `watch` |
 | `hil boot [--no-cycle] [--timeout S] [--log-dir D] [--json]` | power-cycle, watch the UART, time each boot stage, PASS/FAIL |
 | `hil boot --repeat N [--settle S]` | N cycles in a row (board kept up S s between runs); per-stage min/median/max/stdev, pass count |
 | `hil boot --power-interval S` | also sample the plug every S s during the boot: avg/peak W and Wh up to the last stage |

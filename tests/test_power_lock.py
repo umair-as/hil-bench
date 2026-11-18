@@ -150,6 +150,21 @@ class GuardTests(HilTestCase):
 class MainTests(HilTestCase):
     CONFIG = TEST_CONFIG
 
+    def test_watch_options_rejected_on_other_power_actions(self):
+        self.write_config(self.CONFIG)
+        plug = self.use_fakes(None, FakePlug())
+        csv = self.tmp / "ignored.csv"
+        for action in ("on", "off", "cycle", "status"):
+            for option, value in (("--interval", "1"), ("--duration", "0.01"),
+                                  ("--csv", str(csv))):
+                with self.subTest(action=action, option=option):
+                    rc, _, err = self.run_main("power", action, option, value,
+                                               "--off-seconds", "0.01")
+                    self.assertEqual(rc, 2, err)
+                    self.assertIn(f"{option} only applies to power watch", err)
+        self.assertEqual(plug.calls, [])
+        self.assertFalse(csv.exists())
+
     def test_missing_config_exit_2(self):
         rc, _, err = self.run_main("benches")
         self.assertEqual(rc, 2)

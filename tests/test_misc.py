@@ -5,7 +5,7 @@ import unittest
 import urllib.request
 from unittest import mock
 
-from harness import FakePlug, FakeSerial, HilTestCase, hil, ns
+from harness import TEST_CONFIG, FakePlug, FakeSerial, HilTestCase, hil, ns
 
 
 class PlugReplyTests(HilTestCase):
@@ -44,6 +44,16 @@ class ConsoleEncodingTests(HilTestCase):
 
 
 class PowerWatchTests(HilTestCase):
+    def test_cli_watch_defaults_to_one_second_interval(self):
+        self.write_config(TEST_CONFIG)
+        self.use_fakes(None, FakePlug())
+        with mock.patch.object(hil.time, "monotonic", return_value=0), \
+                mock.patch.object(hil.time, "sleep", side_effect=KeyboardInterrupt) as sleep:
+            rc, out, err = self.run_main("power", "watch")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out.splitlines()[-1])["samples"], 1)
+        sleep.assert_called_once_with(1.0)
+
     def test_csv_and_summary(self):
         csv = self.tmp / "w.csv"
         rc = hil.power_watch(ns(interval=0.02, duration=0.07, csv=str(csv)), FakePlug(watts=4.0))
