@@ -18,6 +18,7 @@ promises into file permissions. This page describes that layout. Nothing in
 | Locks | `/var/lib/hil-bench/locks/` | `hil:hil 0755` (others can read and flock) |
 | Logs | `/var/log/hil-bench/` | `hil:hil 0755`, files `0644` (others read only) |
 | Serial adapters | `/dev/serial/by-id/...` | group `hil`, `0660` via a udev rule |
+| MCP socket dir | `/run/hil-bench/` | `hil:hil-clients 2750` (agent users in `hil-clients` only) |
 
 `benches.toml` points at these locations:
 
@@ -36,25 +37,36 @@ shares a bench must use the same lock directory (see
 
 ## Calling it
 
-- **Agent:** a sudoers rule lets the agent's user run only `hil`, as `hil`,
-  with a clean environment:
+- **Agent: only through the MCP socket.** Run `hil mcp` as `hil` (e.g. a
+  systemd service with `User=hil`) and give the agent access to its socket
+  and nothing else:
 
   ```
-  agent ALL=(hil) NOPASSWD: /usr/local/bin/hil
-  Defaults>hil env_reset
+  /run/hil-bench/            hil:hil-clients  2750   (setgid: new files get group hil-clients)
+  /run/hil-bench/mcp.sock    created by: hil mcp --socket /run/hil-bench/mcp.sock --socket-mode 660
   ```
 
-  With `env_reset`, the agent can't pass `HIL_BENCH_CONFIG`,
-  `HIL_LOCK_FD` or `TASMOTA_*`. Put `caller = "agent"` at the top of the
-  service config, so every call through this rule gets the agent policy.
-- **Operator:** a second config readable only by the operator and `hil`
-  that sets the same `[paths]` without `caller`, used through a separate
-  rule (`sudo -u hil env HIL_BENCH_CONFIG=/etc/hil-bench/operator.toml hil`),
-  or `hil` run directly as the operator for maintenance.
-- **A later MCP server** runs as `hil` too and is reached over a Unix
-  socket whose permissions decide who may connect.
+  Put the agent's user in a group of its own (`hil-clients` here). It must
+  **not** be in `hil`, the group that owns the tty and the config. The MCP
+  server forces the agent policy on every call and has no tool for
+  `console`, `hold`, `uboot shell` or `--allow-destructive`. On Linux, a
+  socket created in a setgid directory takes the directory's group, so
+  `--socket-mode 660` opens it to `hil-clients` (check with `ls -l`).
+- **Don't give the agent a sudo rule for the `hil` CLI.** Run as `hil`, the
+  CLI does more than the policy covers: `hil hold -- CMD` runs any program
+  as `hil` (it could read the credentials and open the tty), and
+  `power watch --csv PATH` or `--log-dir DIR` write wherever `hil` can,
+  including the action log. `caller = "agent"` doesn't refuse these.
+- **Operator:** run the CLI as `hil` through your own sudo rule, or run `hil`
+  as yourself with a config that sets the same `[paths]`. The operator's
+  config shouldn't set `caller`.
+- **Flashing under the lock** (`hil hold`) for an agent in this layout is
+  still open. `hold` would have to run the command as the caller, not as
+  `hil`, or offer only a fixed set of flasher commands.
 
 ## What this buys
+
+Provided the MCP socket is the agent's only way in:
 
 - The agent can't read the plug credentials, which are plug admin
   (rules, scripts, OTA URL, `PowerOnState`), so it can't call the plug's

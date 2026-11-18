@@ -50,7 +50,8 @@ template. IPs, serial IDs and credential paths stay out of the repo.
   `max_on_seconds` (`arm_max_on` sets PulseTime before every switch-on;
   `power off` clears it).
 - **Exclusivity:** `bench_lock` takes a per-bench `flock` on
-  `~/.local/state/hil-bench/<bench>.lock` and writes the holder into it.
+  `lock_path(bench)` (`[paths] lock_dir`/`state_dir`, default
+  `~/.local/state/hil-bench/<bench>.lock`) and writes the holder into it.
   The file stays after a run and isn't proof that the bench is busy; the
   flock is. `open_serial` refuses if any process has the tty open
   (`port_busy`: `port_holders` scans `/proc/<pid>/fd`, `flock_holders` reads

@@ -182,6 +182,9 @@ service user to make it binding; see
 [`docs/service-user.md`](docs/service-user.md). A `[paths]` table in
 `benches.toml` (`state_dir`, `lock_dir`, `log_dir`, default `creds_file`)
 moves state, locks, logs and credentials to a shared location for that.
+Under a service user, give agents the MCP socket, not the CLI: run as the
+service user, `hold`, `power watch --csv` and `--log-dir` go beyond what
+the caller policy covers.
 
 ## MCP server (`hil mcp`)
 
@@ -206,11 +209,16 @@ It has a small, fixed tool set:
   allowlist.
 - There is no tool for `console`, `uboot shell`, `hold` or
   `--allow-destructive`, and unknown arguments are rejected.
-- The socket is created `0600` (`--socket-mode 660` lets the owner's group
-  connect). Who may connect is decided by those permissions. Calls run one
-  at a time; a running `boot` blocks the next call.
-- SIGTERM or Ctrl-C stops the server and removes the socket. A stale
-  socket from a crash is replaced on the next start.
+- The socket is created `0600` (`--socket-mode 660` lets the socket's group
+  connect). Who may connect is decided by those permissions; for a
+  service-user setup see [`docs/service-user.md`](docs/service-user.md).
+- **One client at a time.** The server serves one connection until that
+  client disconnects. A second client's connection is queued and gets no
+  answer, not even to `initialize`, until then. Calls run one after the
+  other; a running `boot` blocks the next call.
+- SIGTERM or Ctrl-C lets a running call finish its cleanup (the relay goes
+  back on) and reply, then stops the server and removes the socket. A
+  stale socket from a crash is replaced on the next start.
 
 A client that only speaks stdio connects through `socat`, e.g. in an MCP
 client config:

@@ -12,10 +12,11 @@ this protocol is `hil`-specific apart from the path.
 <state>/<bench>.lock
 ```
 
-`<state>` is `$XDG_STATE_HOME/hil-bench`, or `~/.local/state/hil-bench` when
-`XDG_STATE_HOME` isn't set. Every tool that shares a bench has to use the
-same `<state>`, including tools running as another user. Ask `hil` instead
-of re-deriving it:
+`<state>` is the config's `[paths] lock_dir`, else `[paths] state_dir`, else
+`$XDG_STATE_HOME/hil-bench` (`~/.local/state/hil-bench` when
+`XDG_STATE_HOME` isn't set). Every tool that shares a bench has to use the
+same directory, including tools running as another user (see
+[`service-user.md`](service-user.md)). Ask `hil` instead of re-deriving it:
 
 ```console
 $ hil -b rpi5 lock
