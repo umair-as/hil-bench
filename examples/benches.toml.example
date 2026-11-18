@@ -20,7 +20,7 @@ description = "Raspberry Pi 5 on Tasmota plug"
 [benches.rpi5.power]
 type = "tasmota"
 host = "192.0.2.10"                 # plug IP
-creds_file = "~/.config/tasmota"    # TASMOTA_USER= / TASMOTA_PASS= lines
+creds_file = "/etc/hil-bench/tasmota.creds"   # TASMOTA_USER= / TASMOTA_PASS= lines, mode 0600
 relay = 1
 off_seconds = 5                     # let the PSU caps drain
 # cycle_on_plug = true              # power cycle runs Off; Delay; On on the plug (README "Plug-side safety")
