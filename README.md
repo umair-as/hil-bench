@@ -276,12 +276,19 @@ choice.
 Two Tasmota features make the plug itself finish what the host started.
 Both are off by default. Set them per bench in `[benches.X.power]`:
 
-- **`cycle_on_plug = true`:** `power cycle`, `boot` and `uboot` send
-  `Backlog Power1 Off; Delay N; Power1 On` and let the plug run the cycle,
-  so it finishes even if the host dies halfway. `hil` polls the relay to
-  time the boot from the moment it closes (to about 0.1 s) and switches it
-  on from the host only as a fallback. The off time must be 0.2–360 s
+- **`cycle_on_plug = true`:** `power cycle` sends
+  `Backlog Power1 Off; Delay N; Power1 On` and lets the plug run the cycle,
+  so it finishes even if the host dies halfway (checked live by killing
+  `hil` with `kill -9` mid-cycle). `hil` sends nothing to the plug until
+  the off time is over, then confirms the relay is on, and switches it on
+  from the host only as a fallback. The off time must be 0.2–360 s
   (Tasmota `Delay` limits).
+  **Any other request to the plug during the off time changes it.** On a
+  real plug, a status query every 0.5 s cut a 3 s `Delay` to 0.6 s, and
+  one every 0.05 s stalled it for over 15 s. Don't run `power watch` or
+  `power status` on that plug while it cycles. For the same reason `boot`
+  and `uboot` always cycle from the host: they need the exact moment the
+  relay closes, for stage timing, and a UART flush while it's open.
 - **`max_on_seconds = S`:** a dead-man for unattended runs. Before every
   switch-on (`power on`, `power cycle`, `boot`, `uboot`), `hil` sets the
   plug's `PulseTime` so the plug switches itself off S seconds later, with
@@ -292,9 +299,8 @@ Both are off by default. Set them per bench in `[benches.X.power]`:
 
 `PulseTime` is stored on the plug and also applies when someone presses the
 plug's button. Without either setting or flag, `hil` never touches it.
-Both features depend on documented Tasmota behaviour that hasn't been
-checked against a real plug by `hil`'s tests; try them on a bench before
-relying on them.
+The plug-side cycle was checked on a Tasmota 14.3 plug. `PulseTime` follows
+the documented encoding but hasn't been checked on a real plug yet.
 
 ## License
 

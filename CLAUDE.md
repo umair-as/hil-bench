@@ -45,8 +45,11 @@ template. IPs, serial IDs and credential paths stay out of the repo.
   it uses the HTTP `/cm` API with credentials from `creds_file` or
   `TASMOTA_USER`/`TASMOTA_PASS`. They go through urllib (never a proxy) and
   never into argv. `power_cycle` always switches the relay back on in a
-  `finally`. Opt-in per bench: `cycle_on_plug` (`plug_side_cycle`: Backlog
-  Off/Delay/On, the host polls for t0 and only falls back to On) and
+  `finally`. Opt-in per bench: `cycle_on_plug` (`plug_side_cycle`, only for
+  `power cycle`: Backlog Off/Delay/On, then **no plug traffic until the
+  Delay is over**, because any command received meanwhile changes it on a
+  real plug; then confirm ON, host On only as fallback. Boot/uboot always
+  cycle host-side for an exact t0) and
   `max_on_seconds` (`arm_max_on` sets PulseTime before every switch-on;
   `power off` clears it).
 - **Exclusivity:** `bench_lock` takes a per-bench `flock` on

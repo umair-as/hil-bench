@@ -2,7 +2,10 @@
 
 The fake below models documented Tasmota behaviour (Backlog runs its
 commands in order, Delay is in 0.1 s units, PulseTime switches the relay
-off again after its time). It has not been checked against a real plug."""
+off again after its time), plus what a real plug (Tasmota 14.3) showed:
+any command it receives while a Backlog Delay runs changes that delay
+(polling every 0.5 s cut 3 s to 0.6 s; polling every 0.05 s stalled it for
+over 15 s). The fake records such commands in `disturbed`."""
 
 import re
 import threading
@@ -19,6 +22,8 @@ class FakeTasmotaApi:
         self.step = step  # Tasmota's own pause between backlog commands
         self.lock = threading.Lock()
         self.timer = None
+        self.in_delay = False
+        self.disturbed: list[str] = []
 
     def _switch(self, on: bool):
         with self.lock:
@@ -35,6 +40,8 @@ class FakeTasmotaApi:
 
     def run(self, command: str) -> dict:
         self.log.append(command)
+        if self.in_delay and not command.startswith("Backlog"):
+            self.disturbed.append(command)
         m = re.fullmatch(r"Power1(?: (On|Off))?", command)
         if m:
             if m.group(1):
@@ -51,7 +58,9 @@ class FakeTasmotaApi:
                 for c in steps:
                     d = re.fullmatch(r"Delay (\d+)", c)
                     if d:
+                        self.in_delay = True
                         time.sleep(int(d.group(1)) / 10)
+                        self.in_delay = False
                     else:
                         self.run(c)
                     time.sleep(self.step)
@@ -90,16 +99,38 @@ class PlugSideTests(HilTestCase):
         hil.power_cycle(t, 0.05)
         self.assertEqual(api.log, ["Power1 Off", "Power1 On"])
 
-    def test_plug_side_cycle_uses_backlog_and_waits_for_on(self):
+    def test_plug_side_cycle_uses_backlog_and_confirms_on(self):
         api = FakeTasmotaApi()
         t = self.plug(api, cycle_on_plug=True)
         seen_off = []
-        t0 = hil.power_cycle(t, 0.5, lambda: seen_off.append(api.state))
+        hil.power_cycle(t, 0.5, lambda: seen_off.append(api.state), plug_side=True)
         self.assertEqual(api.state, "ON")
         self.assertIn("Backlog Power1 Off; Delay 5; Power1 On", api.log)
         self.assertEqual(seen_off, ["OFF"])
-        self.assertLessEqual(abs(time.monotonic() - t0), 0.5)
-        self.assertNotIn("Power1 On", [c for c in api.log if not c.startswith("Backlog")][:1])
+        # Host sent only the Backlog and one status query; Off/On came from the plug.
+        self.assertEqual(api.log, ["Backlog Power1 Off; Delay 5; Power1 On", "Power1 Off", "Power1 On", "Power1"])
+
+    def test_plug_side_cycle_sends_nothing_during_the_delay(self):
+        api = FakeTasmotaApi()
+        t = self.plug(api, cycle_on_plug=True)
+        hil.power_cycle(t, 0.6, plug_side=True)
+        self.assertEqual(api.disturbed, [])
+
+    def test_boot_cycles_stay_host_side(self):
+        # Boot and uboot need an exact t0 and a UART flush with the relay
+        # open, which a plug-side cycle can't give; cycle_on_plug is ignored.
+        api = FakeTasmotaApi()
+        t = self.plug(api, cycle_on_plug=True)
+        hil.power_cycle(t, 0.05)
+        self.assertEqual(api.log, ["Power1 Off", "Power1 On"])
+
+    def test_power_cycle_command_uses_plug_side(self):
+        api = FakeTasmotaApi()
+        t = self.plug(api, cycle_on_plug=True)
+        self.use_fakes(None, t)
+        hil.cmd_power(ns(action="cycle", max_on=None, off_seconds=0.3), "t", self.bench())
+        self.assertTrue(any(c.startswith("Backlog") for c in api.log), api.log)
+        self.assertEqual(api.disturbed, [])
 
     def test_plug_side_cycle_finishes_if_host_dies(self):
         api = FakeTasmotaApi()
@@ -108,7 +139,7 @@ class PlugSideTests(HilTestCase):
         def die():
             raise KeyboardInterrupt
         with self.assertRaises(KeyboardInterrupt):
-            hil.power_cycle(t, 0.3, die)
+            hil.power_cycle(t, 0.3, die, plug_side=True)
         time.sleep(0.6)
         self.assertEqual(api.state, "ON")
 
@@ -116,7 +147,7 @@ class PlugSideTests(HilTestCase):
         t = self.plug(FakeTasmotaApi(), cycle_on_plug=True)
         for bad in (0.1, 361):
             with self.assertRaisesRegex(hil.BenchError, "0.2"):
-                hil.power_cycle(t, bad)
+                hil.power_cycle(t, bad, plug_side=True)
 
     def test_plug_side_cycle_relay_never_closes(self):
         api = FakeTasmotaApi()
@@ -133,7 +164,7 @@ class PlugSideTests(HilTestCase):
             return orig(c)
         with mock.patch.object(t, "cmd", stuck), mock.patch.object(hil, "PLUG_CYCLE_GRACE", 0.3):
             with self.assertRaisesRegex(hil.BenchError, "relay"):
-                hil.power_cycle(t, 0.2)
+                hil.power_cycle(t, 0.2, plug_side=True)
         self.assertIn("Power1 On", api.log)  # host-side fallback was tried
 
     # --- dead-man ------------------------------------------------------------

@@ -381,49 +381,59 @@ def arm_max_on(psu, override: float | None = None) -> None:
         psu.set_max_on(secs)
 
 
-# Extra time the plug gets, beyond the off time, to open and close the relay
+# Time the plug gets, after the off time, to report the relay closed again
 # during a plug-side cycle.
 PLUG_CYCLE_GRACE = 10.0
 
 
-def wait_relay(psu, state: str, timeout: float) -> bool:
+def wait_relay(psu, state: str, timeout: float, interval: float = 0.5) -> bool:
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
         if psu.power() == state:
             return True
-        time.sleep(0.05)
-    return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 def plug_side_cycle(psu, off_seconds: float, while_off=None) -> float:
     """Let the plug run Off; Delay; On itself (Backlog), so the cycle finishes
-    even if the host dies halfway. The host polls the relay to time t0 (to
-    about one poll, 0.05 s plus the HTTP round trip) and switches it on
-    itself only as a fallback."""
+    even if the host dies halfway. The host sends nothing to the plug until
+    the off time is over: on a real plug (Tasmota 14.3) any command received
+    during a Backlog Delay changed it (polling every 0.5 s cut 3 s to 0.6 s,
+    every 0.05 s stalled it for over 15 s). So the returned time is when ON
+    was confirmed, not when the relay closed; boot timing never uses this.
+    The host switches the relay on itself only as a fallback."""
     if not 0.2 <= off_seconds <= 360:
         raise BenchError("plug-side cycle: off time must be 0.2..360 s (Tasmota Delay)")
     r, t_on = psu.relay, None
     try:
+        sent = time.monotonic()
         psu.cmd(f"Backlog Power{r} Off; Delay {round(off_seconds * 10)}; Power{r} On")
-        if not wait_relay(psu, "OFF", PLUG_CYCLE_GRACE):
-            raise BenchError("plug-side cycle: never saw the relay open")
+        # Quiet from here until the Delay is over. Off runs first, so the
+        # relay is open after a short moment; while_off doesn't touch the plug.
+        time.sleep(min(0.5, off_seconds / 2))
         if while_off:
             while_off()
-        if wait_relay(psu, "ON", off_seconds + PLUG_CYCLE_GRACE):
+        time.sleep(max(0.0, off_seconds + 1.0 - (time.monotonic() - sent)))
+        if wait_relay(psu, "ON", PLUG_CYCLE_GRACE):
             t_on = time.monotonic()
     finally:
         if t_on is None:
             state = psu.power("On")  # fallback: never leave the board dark
     if t_on is None:
-        raise BenchError(f"plug-side cycle: relay did not close in time (host fallback: {state})")
+        raise BenchError(f"plug-side cycle: relay not back on in time (host fallback: {state})")
     return t_on
 
 
-def power_cycle(psu, off_seconds: float, while_off=None, max_on: float | None = None) -> float:
+def power_cycle(psu, off_seconds: float, while_off=None, max_on: float | None = None,
+                plug_side: bool = False) -> float:
     """Off, wait, on. Returns the monotonic time the relay closed.
-    while_off runs with the relay open (e.g. to drop the old run's UART bytes)."""
+    while_off runs with the relay open (e.g. to drop the old run's UART bytes).
+    plug_side: let a bench with cycle_on_plug run the cycle on the plug
+    (only `hil power cycle`; boot and uboot need the exact relay-close time)."""
     arm_max_on(psu, max_on)
-    if getattr(psu, "plug_cycle", False):
+    if plug_side and getattr(psu, "plug_cycle", False):
         return plug_side_cycle(psu, off_seconds, while_off)
     try:
         # Inside the try: if the relay opened but the reply was lost, the
@@ -583,7 +593,7 @@ def cmd_power(args, name, bench) -> int:
     with bench_lock(name, f"power {args.action}"):
         if args.action == "cycle":
             off = args.off_seconds if args.off_seconds is not None else float(bench["power"].get("off_seconds", 5))
-            power_cycle(psu, off, max_on=args.max_on)
+            power_cycle(psu, off, max_on=args.max_on, plug_side=True)
             print(json.dumps({"relay": "ON", "cycled_off_seconds": off}))
         elif args.action == "on":
             arm_max_on(psu, args.max_on)
