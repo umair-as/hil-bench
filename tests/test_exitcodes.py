@@ -43,6 +43,13 @@ class ExitCodeTests(HilTestCase):
         self.write_config(TEST_CONFIG + "[benches.t.uboot]\ntoo_late_patterns = ['(']\n")
         self.assert_rc2("uboot", "env", says="too_late_patterns")
 
+    def test_non_positive_timeouts_rejected(self):
+        self.write_config(TEST_CONFIG)
+        for argv in (("boot", "--timeout", "0"), ("boot", "--timeout", "-5"),
+                     ("uboot", "env", "--timeout", "0"), ("wait-ssh", "--host", "192.0.2.1", "--timeout", "0")):
+            with self.subTest(argv=argv):
+                self.assert_rc2(*argv, says="--timeout")
+
     def test_unwritable_lock_dir(self):
         blocker = self.tmp / "not-a-dir"
         blocker.write_text("x")

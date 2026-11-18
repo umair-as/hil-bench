@@ -759,7 +759,9 @@ def stage_config(bench: dict, timeout: float | None):
         compiled.append((st["name"], rx, bool(st.get("optional"))))
     # re.M for both lists, so ^ and $ mean line start/end everywhere.
     fails = compile_patterns(boot.get("fail_patterns", DEFAULT_FAIL), "[boot] fail_patterns")
-    return compiled, fails, timeout or float(boot.get("timeout", 180))
+    if timeout is None:
+        timeout = conf_number(boot, "timeout", 180, "[boot]")
+    return compiled, fails, timeout
 
 
 def watch_stages(con: Console, compiled, fails, timeout: float, result: dict) -> bool:
@@ -880,6 +882,7 @@ def cmd_boot(args, name, bench) -> int:
     if args.repeat > 1 and args.no_cycle:
         raise BenchError("--repeat needs power cycles; drop --no-cycle")
     check_interval(args.power_interval, "--power-interval")
+    check_interval(args.timeout, "--timeout")
     if args.settle < 0 or not math.isfinite(args.settle):
         raise BenchError("--settle must be >= 0 seconds")
     compiled, fails, timeout = stage_config(bench, args.timeout)
@@ -1058,7 +1061,7 @@ def read_env(con: Console, names: list[str]) -> dict:
     env = {}
     for var in names:
         out = uboot_cmd(con, f"printenv {var}")["output"]
-        m = re.search(rf"^{var}=(.*)$", out, re.M)
+        m = re.search(rf"^{re.escape(var)}=(.*)$", out, re.M)
         env[var] = m.group(1).strip() if m else None
     return env
 
@@ -1066,6 +1069,7 @@ def read_env(con: Console, names: list[str]) -> dict:
 def uboot_policy_check(args, bench) -> None:
     """Refuse what the caller may not do before anything touches the bench."""
     conf = bench.get("uboot") or {}
+    check_interval(args.timeout, "--timeout")
     if not 1 <= args.attempts <= 99:
         raise BenchError("--attempts must be between 1 and 99")
     if args.caller == "agent":
@@ -1197,7 +1201,9 @@ def cmd_wait_ssh(args, name, bench) -> int:
     if not host:
         raise BenchError("no ssh host (--host, HIL_TARGET, or ssh.host)")
     port = int(ssh.get("port", 22))
-    deadline = time.monotonic() + (args.timeout or float(ssh.get("timeout", 120)))
+    check_interval(args.timeout, "--timeout")
+    timeout = args.timeout if args.timeout is not None else conf_number(ssh, "timeout", 120, "[ssh]")
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             with socket.create_connection((host, port), timeout=2) as s:

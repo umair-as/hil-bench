@@ -68,6 +68,13 @@ class UbootCommandTests(UbootHelpers):
         self.assertEqual(rc, 0)
         self.assertEqual(js["env_before"], {"bootcount": "2", "rauc_slot": "A"})
 
+    def test_env_var_names_are_matched_literally(self):
+        ub = FakeUboot(env={"A+B": "1", "x.y": "2"})
+        self.setup_board(ub)
+        rc, js = self.uboot(self.bench(uboot={"env_vars": ["A+B", "x.y"]}), action="env")
+        self.assertEqual(rc, 0, js)
+        self.assertEqual(js["env_before"], {"A+B": "1", "x.y": "2"})
+
     def test_slot_on_rauc_bench(self):
         ub = FakeUboot(env={"BOOT_ORDER": "A B", "BOOT_A_LEFT": "0", "BOOT_B_LEFT": "3"})
         self.setup_board(ub)
