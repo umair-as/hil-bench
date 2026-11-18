@@ -93,5 +93,43 @@ class UbootCommandTests(UbootHelpers):
         self.assertIn("login", js["stages"])
 
 
+class ThenBootStageTests(UbootHelpers):
+    """--then boot judges only what follows `boot`; stages printed before the
+    autoboot interrupt can't repeat."""
+
+    STAGES = [{"name": "eeprom", "pattern": "BOOTLOADER", "optional": True},
+              {"name": "uboot", "pattern": r"U-Boot \d{4}\.\d{2}"},
+              {"name": "kernel", "pattern": "Booting Linux", "optional": True},
+              {"name": "login", "pattern": r"^(?!Last )\S+ login: "}]
+
+    def test_required_stage_before_interrupt_is_not_expected_again(self):
+        ub = FakeUboot(banner="BOOTLOADER release\nU-Boot 2024.01\n")
+        self.setup_board(ub)
+        rc, js = self.uboot(self.bench(boot={"stages": self.STAGES}), action="env", then="boot", timeout=2)
+        self.assertEqual(rc, 0, js)
+        self.assertEqual(js["before_interrupt"], ["eeprom", "uboot"])
+        self.assertEqual(js["missed"], [])
+
+    def test_required_stage_not_seen_before_interrupt_stays_required(self):
+        stages = self.STAGES[:2] + [{"name": "fit", "pattern": r"Verifying Hash Integrity.*OK"}] + self.STAGES[2:]
+        ub = FakeUboot(banner="U-Boot 2024.01\n")
+        self.setup_board(ub)
+        rc, js = self.uboot(self.bench(boot={"stages": stages}), action="env", then="boot", timeout=1)
+        self.assertEqual(rc, 1)
+        self.assertEqual(js["before_interrupt"], ["uboot"])
+        self.assertIn("fit", js["missed"])
+
+    def test_stage_matching_out_of_order_is_not_dropped(self):
+        # "login" text appears before the interrupt but after a required stage
+        # that never printed, so it is not part of the in-order run seen.
+        stages = [{"name": "spl", "pattern": "U-Boot SPL"}, {"name": "login", "pattern": "login: "}]
+        ub = FakeUboot(banner="old login: \nU-Boot 2024.01\n")
+        self.setup_board(ub)
+        rc, js = self.uboot(self.bench(boot={"stages": stages}), action="env", then="boot", timeout=1)
+        self.assertEqual(rc, 1)
+        self.assertEqual(js["before_interrupt"], [])
+        self.assertIn("spl", js["missed"])
+
+
 if __name__ == "__main__":
     unittest.main()

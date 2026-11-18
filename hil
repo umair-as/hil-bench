@@ -451,7 +451,25 @@ def watch_stages(con: Console, compiled, fails, timeout: float, result: dict) ->
     return result["fail_match"] is None and required <= result["stages"].keys()
 
 
+def stages_already_seen(compiled, text: str) -> list[str]:
+    """Names of the stages that `text` already shows, walked in order the way
+    watch_stages does: an optional stage may be absent, a missing required
+    one ends the run. Used for the part of a boot printed before an
+    autoboot interrupt, which won't repeat after `boot`."""
+    seen, pos = [], 0
+    for sname, rx, optional in compiled:
+        m = rx.search(text, pos)
+        if m:
+            seen.append(sname)
+            pos = m.end()
+        elif not optional:
+            break
+    return seen
+
+
 def print_stages(result: dict) -> None:
+    if result.get("before_interrupt"):
+        print(f"     ---   {', '.join(result['before_interrupt'])} (before the autoboot interrupt)")
     prev = 0.0
     for sname, t in result["stages"].items():
         print(f"  {t:7.2f}s  (+{t - prev:6.2f}s)  {sname}")
@@ -714,8 +732,10 @@ def cmd_uboot(args, name, bench) -> int:
             if then == "boot":
                 compiled, fails, timeout = stage_config(bench, args.timeout)
                 # Stages already passed before the interrupt (eeprom, U-Boot
-                # banner) won't repeat; only judge what follows "boot".
-                compiled = [c for c in compiled if not (c[2] and c[1].search(con.buf))]
+                # banner) won't repeat, required or not; judge only the rest.
+                seen = stages_already_seen(compiled, con.buf)
+                result["before_interrupt"] = seen
+                compiled = [c for c in compiled if c[0] not in seen]
                 mark = con.mark()
                 con.write("boot\r")
                 con.drop_before(mark)  # judge only the boot we just started

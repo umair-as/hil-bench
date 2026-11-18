@@ -113,8 +113,11 @@ itself still runs.
 | `shell` | stop autoboot, then hand the prompt to `tio` |
 
 `--then boot` (default) runs `boot` and watches the console until login, so a
-repair is checked by a real boot in the same run. `--then stay` leaves the
-board at the prompt, and `--then reset` resets it.
+repair is checked by a real boot in the same run. Stages the console already
+showed, in order, before the autoboot interrupt (an EEPROM or U-Boot banner)
+can't repeat, so they are listed as `before_interrupt` and not expected
+again, required or not. `--then stay` leaves the board at the prompt, and
+`--then reset` resets it.
 
 - **Stop string:** read from the autoboot prompt itself (`type 'xyz' to
   stop`), or `--stop-string` / `[benches.X.uboot] stop_string`. Plain
