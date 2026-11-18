@@ -92,6 +92,34 @@ class BootCommandTests(HilTestCase):
         self.assertEqual(hil.cmd_boot(args, "t", self.bench()), 1)
 
 
+class BufferTrimTests(HilTestCase):
+    """The decoded buffer is capped; offsets kept across a trim must stay valid."""
+
+    def test_stage_found_after_buffer_trim(self):
+        noise = ("x" * 99 + "\n") * 9000          # ~900 KB before the kernel line
+        tail = ("y" * 99 + "\n") * 2000           # ~200 KB after it
+        out = noise + "Booting Linux on CPU 0\n" + tail + "board login: "
+        compiled, fails, _ = hil.stage_config({}, 5)
+        con = self.console(FakeSerial(out))
+        r = result()
+        ok = hil.watch_stages(con, compiled, fails, 5, r)
+        self.assertTrue(ok, r)
+        self.assertEqual(r["missed"], [])
+
+    def test_fail_pattern_found_after_buffer_trim(self):
+        out = ("x" * 99 + "\n") * 9000 + "Booting Linux\n" + ("y" * 99 + "\n") * 2000 + "Kernel panic\n"
+        compiled, fails, _ = hil.stage_config({}, 5)
+        r = result()
+        self.assertFalse(hil.watch_stages(self.console(FakeSerial(out)), compiled, fails, 5, r))
+        self.assertEqual(r["fail_match"], "Kernel panic")
+
+    def test_expect_start_survives_trim(self):
+        con = self.console(FakeSerial(("z" * 99 + "\n") * 10600 + "MARK\n"))
+        start = con.mark()
+        m = con.expect(hil.re.compile("MARK"), 5, start=start)
+        self.assertIsNotNone(m)
+
+
 class SeriesTests(unittest.TestCase):
     def test_series_stats(self):
         runs = [{"stages": {"kernel": 5.0, "login": 28.0}, "power": {"samples": 3, "wh": 0.02}},

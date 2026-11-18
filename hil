@@ -354,11 +354,28 @@ def power_watch(args, psu) -> int:
 
 
 class Console:
-    """UART reader that logs raw bytes and keeps a decoded, searchable buffer."""
+    """UART reader that logs raw bytes and keeps a decoded, searchable buffer.
+
+    The buffer is capped, so offsets that outlive a pump() are absolute:
+    `base` counts the characters trimmed off its front. mark() returns the
+    current end as an absolute offset, local() turns one back into an index
+    into `buf` (0 if that text was already trimmed)."""
 
     def __init__(self, ser, log, t0: float):
         self.ser, self.log, self.t0 = ser, log, t0
         self.buf = ""
+        self.base = 0
+
+    def mark(self) -> int:
+        return self.base + len(self.buf)
+
+    def local(self, pos: int) -> int:
+        return min(max(0, pos - self.base), len(self.buf))
+
+    def drop_before(self, pos: int) -> None:
+        """Forget everything before absolute offset pos."""
+        cut = self.local(pos)
+        self.buf, self.base = self.buf[cut:], self.base + cut
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.t0, 2)
@@ -372,7 +389,7 @@ class Console:
         text = chunk.decode("latin-1").replace("\r", "")
         self.buf += text
         if len(self.buf) > 1 << 20:  # bounded on chatty consoles
-            self.buf = self.buf[-(1 << 16):]
+            self.drop_before(self.mark() - (1 << 16))
         return text
 
     def write(self, data: str) -> None:
@@ -384,11 +401,12 @@ class Console:
             time.sleep(0.01)
 
     def expect(self, rx: re.Pattern, timeout: float, start: int | None = None):
-        """Wait for rx in the buffer from `start` (default: now). Returns match or None."""
-        pos = len(self.buf) if start is None else start
+        """Wait for rx in the buffer from absolute offset `start` (default: now).
+        Returns the match (indices into the current `buf`) or None."""
+        pos = self.mark() if start is None else start
         deadline = time.monotonic() + timeout
         while True:
-            m = rx.search(self.buf, min(pos, len(self.buf)))
+            m = rx.search(self.buf, self.local(pos))
             if m:
                 return m
             if time.monotonic() >= deadline:
@@ -407,22 +425,22 @@ def stage_config(bench: dict, timeout: float | None):
 def watch_stages(con: Console, compiled, fails, timeout: float, result: dict) -> bool:
     """Match stages in order on the console (including what is already
     buffered). Optional stages may be silent; required ones decide PASS."""
-    pos = idx = scanned = 0
+    pos = idx = scanned = 0  # absolute offsets (see Console)
     while idx < len(compiled) and time.monotonic() - con.t0 < timeout:
         # Fail patterns: scan only new text (with overlap for split lines).
-        fail = next((m for f in fails if (m := f.search(con.buf, max(0, scanned - 200)))), None)
-        scanned = len(con.buf)
+        fail = next((m for f in fails if (m := f.search(con.buf, con.local(scanned - 200)))), None)
+        scanned = con.mark()
         if fail:
             result["fail_match"] = fail.group(0)
             break
         progressed = False
         for j in range(idx, len(compiled)):
             sname, rx, optional = compiled[j]
-            m = rx.search(con.buf, min(pos, len(con.buf)))
+            m = rx.search(con.buf, con.local(pos))
             if m:
                 result["missed"] += [compiled[k][0] for k in range(idx, j)]
                 result["stages"][sname] = con.elapsed()
-                pos, idx, progressed = m.end(), j + 1, True
+                pos, idx, progressed = con.base + m.end(), j + 1, True
                 break
             if not optional:
                 break
@@ -581,11 +599,12 @@ def uboot_interrupt(con: Console, bench: dict, stop: str | None, timeout: float)
         m = AUTOBOOT_RX.search(con.buf)
         if m:
             key = stop or conf.get("stop_string") or m.group(1) or " "
+            after = con.base + m.end()
             con.write(key)
-            if not con.expect(re.compile(UBOOT_PROMPT + r"$"), 5, start=m.end()):
+            if not con.expect(re.compile(UBOOT_PROMPT + r"$"), 5, start=after):
                 # Some builds want a newline after a keyed string.
                 con.write("\r")
-                if not con.expect(re.compile(UBOOT_PROMPT + r"$"), 3, start=m.end()):
+                if not con.expect(re.compile(UBOOT_PROMPT + r"$"), 3, start=after):
                     raise UbootError(f"sent stop string {key!r} but got no U-Boot prompt")
             return {"autoboot_prompt": m.group(0), "stop_string": key, "at": con.elapsed()}
         if too_late.search(con.buf):
@@ -600,7 +619,7 @@ def uboot_cmd(con: Console, cmd: str, timeout: float = 10) -> dict:
     if "\n" in cmd or "\r" in cmd:
         raise BenchError("one U-Boot command per line")
     for _attempt in (1, 2):
-        mark = len(con.buf)
+        mark = con.mark()
         con.write(cmd)
         echo_rx = re.compile(re.escape(cmd) + r"$")
         if con.expect(echo_rx, 3, start=mark):
@@ -609,12 +628,12 @@ def uboot_cmd(con: Console, cmd: str, timeout: float = 10) -> dict:
         con.expect(re.compile(UBOOT_PROMPT + r"$"), 3, start=mark)
     else:
         raise UbootError(f"echo mismatch twice for {cmd!r}; not executed")
-    mark = len(con.buf)
+    mark = con.mark()
     con.write("\r")
     m = con.expect(re.compile(UBOOT_PROMPT + r"$"), timeout, start=mark)
     if not m:
         raise UbootError(f"no prompt after {cmd!r} within {timeout:.0f}s")
-    out = con.buf[mark:m.start()].strip("\n")
+    out = con.buf[con.local(mark):m.start()].strip("\n")
     return {"cmd": cmd, "output": out}
 
 
@@ -697,9 +716,9 @@ def cmd_uboot(args, name, bench) -> int:
                 # Stages already passed before the interrupt (eeprom, U-Boot
                 # banner) won't repeat; only judge what follows "boot".
                 compiled = [c for c in compiled if not (c[2] and c[1].search(con.buf))]
-                mark = len(con.buf)
+                mark = con.mark()
                 con.write("boot\r")
-                con.buf = con.buf[mark:]  # judge only the boot we just started
+                con.drop_before(mark)  # judge only the boot we just started
                 ok = watch_stages(con, compiled, fails, con.elapsed() + timeout, result)
             elif then == "reset":
                 con.write("reset\r")
