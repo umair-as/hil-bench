@@ -12,6 +12,7 @@ never in this tool.
     hil uboot  env|slot A|B|reset-counters|run -c CMD...|shell  [--then boot|stay|reset]
     hil wait-ssh [--host H] [--timeout S]
     hil console [--log-dir DIR]
+    hil hold -- CMD [ARGS...]
     hil benches
 
 Exit status: 0 pass, 1 target failed a check, 2 bench/config/infra error,
@@ -30,9 +31,11 @@ import math
 import os
 import pwd
 import re
+import shlex
 import shutil
 import socket
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -82,11 +85,36 @@ def get_bench(cfg: dict, name: str | None) -> tuple[str, dict]:
     return name, benches[name]
 
 
+def inherited_lock(path: Path) -> int | None:
+    """The lock fd handed down by `hil hold` (HIL_LOCK_FD), if it really is
+    this bench's lock and this process tree holds it. Proof is a successful
+    non-blocking flock on that very fd: an fd from a fresh open() of the
+    lock file fails it while someone else holds the lock."""
+    raw = os.environ.get("HIL_LOCK_FD", "")
+    if not raw.isdigit():
+        return None
+    fd = int(raw)
+    try:
+        st, want = os.fstat(fd), os.stat(path)
+        if (st.st_dev, st.st_ino) != (want.st_dev, want.st_ino):
+            return None
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:  # bad fd, no lock file, or held by someone else
+        return None
+    return fd
+
+
 @contextlib.contextmanager
 def bench_lock(name: str, what: str):
-    """Exclusive per-bench lock so two projects never cycle the same board."""
+    """Exclusive per-bench lock so two projects never cycle the same board.
+    Yields the lock's fd. Inside `hil hold`, the inherited lock is reused:
+    nothing is rewritten and nothing is released on exit."""
     STATE.mkdir(parents=True, exist_ok=True)
     path = STATE / f"{name}.lock"
+    nested = inherited_lock(path)
+    if nested is not None:
+        yield nested
+        return
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         try:
@@ -96,7 +124,7 @@ def bench_lock(name: str, what: str):
             raise BenchLocked(f"bench '{name}' is busy: {holder or 'unknown holder'}")
         os.ftruncate(fd, 0)
         os.pwrite(fd, f"pid {os.getpid()} ({what}) since {now_iso()}\n".encode(), 0)
-        yield
+        yield fd
     finally:
         os.close(fd)
 
@@ -889,6 +917,29 @@ def cmd_console(args, name, bench) -> int:
     os.execv(tio, [tio, "-b", baud, "--log", "--log-directory", str(log_dir), port])
 
 
+def cmd_hold(args, name, bench) -> int:
+    """Run a command (flasher, installer, test script) under the bench lock,
+    so no other hil call can cut power or take the UART meanwhile."""
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        raise BenchError("hold needs a command: hil hold -- CMD [ARGS...]")
+    with bench_lock(name, f"hold: {shlex.join(command)[:120]}") as fd:
+        # The child (and any hil it runs on this bench) inherits the lock.
+        env = os.environ | {"HIL_BENCH": name, "HIL_LOCK_FD": str(fd)}
+        try:
+            proc = subprocess.Popen(command, env=env, pass_fds=(fd,))
+        except OSError as e:
+            raise BenchError(f"cannot run {command[0]}: {e}") from None
+        while True:
+            try:
+                rc = proc.wait()
+                break
+            except KeyboardInterrupt:
+                # The child got the same SIGINT; keep the lock until it exits.
+                continue
+    return 128 - rc if rc < 0 else rc
+
+
 def cmd_benches(args, cfg) -> int:
     default = cfg.get("default_bench")
     for n, b in cfg.get("benches", {}).items():
@@ -949,6 +1000,9 @@ def main() -> int:
     p = sub.add_parser("console", help="interactive tio session with logging")
     p.add_argument("--log-dir")
 
+    p = sub.add_parser("hold", help="run a command under the bench lock (flash, install, test script)")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="-- CMD [ARGS...]")
+
     sub.add_parser("benches", help="list configured benches")
 
     args = ap.parse_args()
@@ -958,7 +1012,7 @@ def main() -> int:
             return cmd_benches(args, cfg)
         name, bench = get_bench(cfg, args.bench)
         fn = {"power": cmd_power, "boot": cmd_boot, "uboot": cmd_uboot, "wait-ssh": cmd_wait_ssh,
-              "console": cmd_console}[args.cmd]
+              "console": cmd_console, "hold": cmd_hold}[args.cmd]
         if is_recorded(args):
             return run_recorded(name, args, lambda: fn(args, name, bench))
         return fn(args, name, bench)

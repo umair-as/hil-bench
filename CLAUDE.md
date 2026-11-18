@@ -46,7 +46,10 @@ template. IPs, serial IDs and credential paths stay out of the repo.
   The file stays after a run and isn't proof that the bench is busy; the
   flock is. `open_serial` refuses if any process has the tty open
   (`port_holders` scans `/proc`), because a tty has no fan-out. Close MCP
-  serial sessions and `tio` first.
+  serial sessions and `tio` first. `hil hold -- CMD` runs another tool under
+  the lock and hands it down as `HIL_LOCK_FD`; `inherited_lock` accepts that
+  fd only if a non-blocking `flock` on it succeeds, and nested use neither
+  rewrites nor releases the lock.
 - **Console:** logs raw bytes to the log file, keeps a decoded buffer capped
   at 1 MiB, and paces writes in 8-byte chunks (U-Boot UART has no flow control).
 - **Boot checking:** `stage_config` compiles the bench's stages and fail

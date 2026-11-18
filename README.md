@@ -36,6 +36,7 @@ carries the credentials in the URL query string.
 | `hil uboot env\|slot A\|B\|reset-counters\|run -c CMD…\|shell` | stop autoboot, inspect/repair the U-Boot env (see below) |
 | `hil wait-ssh [--host H] [--timeout S]` | wait for the sshd banner |
 | `hil console [--log-dir D]` | interactive `tio` with logging |
+| `hil hold -- CMD [ARGS…]` | run CMD (flasher, installer, test script) under the bench lock; exits with CMD's code |
 
 Select a bench with `-b NAME`, `HIL_BENCH`, or `default_bench`.
 
@@ -152,6 +153,19 @@ again, required or not. `--then stay` leaves the board at the prompt, and
   part of the bytes. `hil boot` and `hil console` refuse if anything already
   has the port open (and name the process). Before running, close any MCP
   serial session (`serial_close`) and quit `tio`.
+- **Other tools under the lock.** The lock only covers `hil`'s own
+  commands. Wrap anything that must not lose power halfway, such as a
+  flasher, an update install over SSH, or an OTA upload, in
+  `hil hold -- CMD`. Every other `hil` call on that bench then gets exit `3`
+  until CMD exits. CMD runs with `HIL_BENCH` set and inherits the lock as
+  file descriptor `HIL_LOCK_FD`, so a `hil` call inside CMD (e.g. a power
+  cycle between flashing steps) reuses the lock instead of deadlocking.
+  `hil` accepts that fd only if a non-blocking `flock` on it succeeds, which
+  an fd from a fresh `open()` of the lock file doesn't while someone else
+  holds it. A process CMD leaves running in the background keeps the fd,
+  and so keeps the bench locked, until it exits. Errors before CMD starts
+  exit `2`/`3`; after that the exit code is CMD's own (`128+N` for a
+  signal).
 - If a cycle is interrupted (Ctrl-C), the relay is always switched back on,
   so the board isn't left without power.
 - **Action log.** Every state-changing command (`power on/off/cycle`, `boot`,
