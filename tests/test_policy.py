@@ -135,6 +135,26 @@ class AgentUbootTests(UbootHelpers):
             self.assertEqual(rc, 0, js)
             self.assertIn("saveenv", ub.executed)
 
+    def test_own_rc_probe_is_not_filtered(self):
+        # hil reads each command's exit status with its own `echo HILRC=$?`.
+        # The `$` denylist rule would catch that text, so this checks the
+        # filter only applies to caller-supplied `run -c` commands.
+        self.assertTrue(hil.is_destructive("echo HILRC=$?"))
+        cases = [("slot", "B", [], "human"), ("slot", "A", [], "agent"),
+                 ("reset-counters", None, [], "human"), ("reset-counters", None, [], "agent"),
+                 ("run", None, ["printenv BOOT_ORDER"], "human"),
+                 ("run", None, ["printenv BOOT_ORDER"], "agent")]
+        for action, slot, cmds, caller in cases:
+            with self.subTest(action=action, caller=caller):
+                ub = FakeUboot(env={"BOOT_ORDER": "A B", "BOOT_A_LEFT": "0", "BOOT_B_LEFT": "0"})
+                self.setup_board(ub)
+                rc, js = self.uboot(self.agent_bench(allow=["printenv *"]), action=action, slot=slot,
+                                    commands=cmds, caller=caller)
+                self.assertEqual(rc, 0, js)
+                probes = [c for c in ub.executed if c == "echo HILRC=$?"]
+                self.assertEqual(len(probes), len(js["commands"]))
+                self.assertTrue(all(c["rc"] == 0 for c in js["commands"]), js["commands"])
+
     def test_human_needs_flag_for_saveenv_via_run(self):
         with self.assertRaisesRegex(hil.BenchError, "destructive"):
             self.uboot(self.agent_bench(), action="run", commands=["saveenv"])
