@@ -43,6 +43,16 @@ class PowerTests(HilTestCase):
         self.assertEqual((t.user, t.password), ("admin", "s3cret"))
 
 
+class PowerCycleReplyLostTests(HilTestCase):
+    def test_relay_switched_back_on_when_off_reply_is_lost(self):
+        plug = FakePlug()
+        plug.fail_after = {"Off"}
+        with self.assertRaises(hil.BenchError):
+            hil.power_cycle(plug, 0.01)
+        self.assertEqual(plug.state, "ON")
+        self.assertEqual(plug.calls, ["power Off", "power On"])
+
+
 class LockTests(HilTestCase):
     def test_second_holder_is_refused_with_holder_info(self):
         with hil.bench_lock("t", "power cycle"):

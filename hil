@@ -175,8 +175,10 @@ def make_power(bench: dict):
 def power_cycle(psu, off_seconds: float, while_off=None) -> float:
     """Off, wait, on. Returns the monotonic time the relay closed.
     while_off runs with the relay open (e.g. to drop the old run's UART bytes)."""
-    psu.power("Off")
     try:
+        # Inside the try: if the relay opened but the reply was lost, the
+        # finally still closes it again.
+        psu.power("Off")
         time.sleep(off_seconds)
         if while_off:
             while_off()
