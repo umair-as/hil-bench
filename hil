@@ -48,12 +48,11 @@ import threading
 import time
 import tomllib
 import traceback
-import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, NoReturn, Protocol
 
 CONFIG = Path(os.environ.get("HIL_BENCH_CONFIG", "~/.config/hil-bench/benches.toml")).expanduser()
 
@@ -391,10 +390,12 @@ class Tasmota:
         try:
             with _DIRECT.open(url, timeout=5) as r:
                 body = json.loads(r.read())
-        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as e:
+        except (OSError, http.client.HTTPException) as e:  # URLError and timeouts are OSErrors
             raise BenchError(f"tasmota {self.host} unreachable: {getattr(e, 'reason', e)}") from None
         except json.JSONDecodeError:
             raise BenchError(f"tasmota {self.host}: non-JSON reply (bad credentials?)") from None
+        if not isinstance(body, dict):
+            raise BenchError(f"tasmota {self.host}: unexpected reply {body!r:.80}")
         if "WARNING" in body:
             raise BenchError(f"tasmota {self.host}: {body['WARNING']}")
         return body
@@ -423,7 +424,17 @@ class Tasmota:
         return {"relay": self.power()} | self.energy()
 
 
-def make_power(bench: dict):
+class PowerSwitch(Protocol):
+    """What hil needs from a power backend (Tasmota today; fakes in tests).
+    Optional extras, probed with getattr: max_on, set_max_on() (dead-man
+    timer) and plug_cycle with relay/cmd() (plug-side power cycle)."""
+
+    def power(self, action: str | None = None) -> str: ...
+    def energy(self) -> dict: ...
+    def status(self) -> dict: ...
+
+
+def make_power(bench: dict) -> PowerSwitch:
     conf = bench.get("power") or {}
     if not conf:
         raise BenchError("bench has no [power] table")
@@ -487,7 +498,7 @@ def plug_side_cycle(psu, off_seconds: float, while_off=None) -> float:
     return t_on
 
 
-def power_cycle(psu, off_seconds: float, while_off=None, max_on: float | None = None,
+def power_cycle(psu: PowerSwitch, off_seconds: float, while_off=None, max_on: float | None = None,
                 plug_side: bool = False) -> float:
     """Off, wait, on. Returns the monotonic time the relay closed.
     while_off runs with the relay open (e.g. to drop the old run's UART bytes).
@@ -629,6 +640,13 @@ def open_serial(bench: dict):
         raise BenchError(f"cannot open {port}: {e}") from None
 
 
+def write_json(path: Path, obj) -> None:
+    """Write a JSON summary atomically, so a reader never sees half a file."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
 def log_paths(log_dir: str | None, name: str, kind: str) -> tuple[Path, Path]:
     d = Path(log_dir).expanduser() if log_dir else default_log_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -672,14 +690,17 @@ def power_watch(args, psu) -> int:
     """Sample W/V/A until --duration or Ctrl-C, then summarize. Read-only: no lock."""
     check_interval(args.interval, "--interval")
     check_interval(args.duration, "--duration")
-    try:
-        csv = Path(args.csv).expanduser().open("w") if args.csv else None
-    except OSError as e:
-        raise BenchError(f"cannot write --csv: {e}") from None
-    if csv:
-        csv.write("t_s,watts,volts,amps\n")
-    samples, errors, t0 = [], 0, time.monotonic()
-    try:
+    samples, errors = [], 0
+    with contextlib.ExitStack() as stack:
+        csv = None
+        if args.csv:
+            try:
+                csv = stack.enter_context(Path(args.csv).expanduser().open("w"))
+            except OSError as e:
+                raise BenchError(f"cannot write --csv: {e}") from None
+            csv.write("t_s,watts,volts,amps\n")
+        stack.enter_context(contextlib.suppress(KeyboardInterrupt))  # Ctrl-C ends sampling
+        t0 = time.monotonic()
         while args.duration is None or time.monotonic() - t0 <= args.duration:
             tick = time.monotonic()
             try:
@@ -696,13 +717,17 @@ def power_watch(args, psu) -> int:
                     csv.write(line + "\n")
                     csv.flush()
             time.sleep(max(0.0, args.interval - (time.monotonic() - tick)))
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if csv:
-            csv.close()
     print(json.dumps(power_summary(samples) | ({"errors": errors} if errors else {})))
     return 0
+
+
+# The decoded console buffer is capped: past CONSOLE_BUF_MAX characters only
+# the last CONSOLE_BUF_KEEP are kept (offsets stay valid, see Console.base).
+CONSOLE_BUF_MAX = 1 << 20
+CONSOLE_BUF_KEEP = 1 << 16
+# U-Boot's UART has a small RX FIFO and no flow control: type in small paced chunks.
+UART_WRITE_CHUNK = 8
+UART_WRITE_PAUSE_S = 0.01
 
 
 class Console:
@@ -743,20 +768,23 @@ class Console:
         self.log.flush()
         text = chunk.decode("latin-1").replace("\r", "")
         self.buf += text
-        if len(self.buf) > 1 << 20:  # bounded on chatty consoles
-            self.drop_before(self.mark() - (1 << 16))
+        if len(self.buf) > CONSOLE_BUF_MAX:  # bounded on chatty consoles
+            self.drop_before(self.mark() - CONSOLE_BUF_KEEP)
         return text
 
     def write(self, data: str) -> None:
         # Paced: the U-Boot UART has a small RX FIFO and no flow control.
-        raw = data.encode()
-        for i in range(0, len(raw), 8):
+        try:
+            raw = data.encode("latin-1")  # the same codec pump() decodes with
+        except UnicodeEncodeError:
+            raise BenchError(f"can't type {data!r} on the console: not latin-1") from None
+        for i in range(0, len(raw), UART_WRITE_CHUNK):
             try:
-                self.ser.write(raw[i:i + 8])
+                self.ser.write(raw[i:i + UART_WRITE_CHUNK])
                 self.ser.flush()
             except OSError as e:
                 raise BenchError(f"serial write failed: {e}") from None
-            time.sleep(0.01)
+            time.sleep(UART_WRITE_PAUSE_S)
 
     def expect(self, rx: re.Pattern, timeout: float, start: int | None = None):
         """Wait for rx in the buffer from absolute offset `start` (default: now).
@@ -925,11 +953,11 @@ def boot_once(args, name, bench, ser, check: StageConfig, kind: str) -> dict:
         # Bench/infra failure (plug, port): still leave a record of the run,
         # including the stages reached before it.
         result |= sr.as_json() | {"error": str(e), "result": "ERROR"}
-        json_path.write_text(json.dumps(result, indent=2) + "\n")
+        write_json(json_path, result)
         raise
     result |= sr.as_json()
     result["result"] = "PASS" if sr.passed(check) else "FAIL"
-    json_path.write_text(json.dumps(result, indent=2) + "\n")
+    write_json(json_path, result)
     return result
 
 
@@ -991,7 +1019,7 @@ def cmd_boot(args, name, bench) -> int:
     if aborted:
         series["aborted"] = aborted
     _, json_path = log_paths(args.log_dir, name, "boot-series")
-    json_path.write_text(json.dumps(series, indent=2) + "\n")
+    write_json(json_path, series)
     if aborted:
         print(f"hil: series aborted after {len(runs)}/{args.repeat} runs: {aborted}", file=sys.stderr)
         print(f"partial summary: {json_path}", file=sys.stderr)
@@ -1016,6 +1044,9 @@ AUTOBOOT_RX = re.compile(r"[Tt]ype '([^']+)'[^\n]*(?:stop|autoboot)|Hit any key 
 # Extend per bench with [uboot] too_late_patterns (e.g. a bootcmd's own log tag).
 TOO_LATE_DEFAULT = [r"## Loading kernel", r"Starting kernel", r"Booting Linux"]
 UBOOT_PROMPT = r"(?:U-Boot> |=> )"
+PROMPT_AFTER_STOP_S = 5   # prompt after the stop string...
+PROMPT_RETRY_S = 3        # ...and after the extra Enter some keyed builds need
+ECHO_TIMEOUT_S = 3        # a typed command's echo, or the prompt after Ctrl-C
 # Commands that can destroy a card or the env, lock the board out of hil
 # (bootdelay/bootcmd + saveenv), burn OTP, or poke memory and buses; they
 # need --allow-destructive. A denylist on command text can't see through
@@ -1076,10 +1107,10 @@ def uboot_interrupt(con: Console, bench: dict, stop: str | None, timeout: float)
             key = stop or conf.get("stop_string") or m.group(1) or " "
             after = con.base + m.end()
             con.write(key)
-            if not con.expect(re.compile(UBOOT_PROMPT + r"$"), 5, start=after):
+            if not con.expect(re.compile(UBOOT_PROMPT + r"$"), PROMPT_AFTER_STOP_S, start=after):
                 # Some builds want a newline after a keyed string.
                 con.write("\r")
-                if not con.expect(re.compile(UBOOT_PROMPT + r"$"), 3, start=after):
+                if not con.expect(re.compile(UBOOT_PROMPT + r"$"), PROMPT_RETRY_S, start=after):
                     raise UbootError(f"sent stop string {key!r} but got no U-Boot prompt")
             return {"autoboot_prompt": m.group(0), "stop_string": key, "at": con.elapsed()}
         if too_late.search(con.buf):
@@ -1097,10 +1128,10 @@ def uboot_cmd(con: Console, cmd: str, timeout: float = 10) -> dict:
         mark = con.mark()
         con.write(cmd)
         echo_rx = re.compile(re.escape(cmd) + r"$")
-        if con.expect(echo_rx, 3, start=mark):
+        if con.expect(echo_rx, ECHO_TIMEOUT_S, start=mark):
             break
         con.write("\x03")  # Ctrl-C: discard the garbled line, get a fresh prompt
-        con.expect(re.compile(UBOOT_PROMPT + r"$"), 3, start=mark)
+        con.expect(re.compile(UBOOT_PROMPT + r"$"), ECHO_TIMEOUT_S, start=mark)
     else:
         raise UbootError(f"echo mismatch twice for {cmd!r}; not executed")
     mark = con.mark()
@@ -1238,12 +1269,12 @@ def cmd_uboot(args, name, bench) -> int:
         result |= sr.as_json() | {"error": str(e), "result": "ERROR"}
         if not log_path.exists():
             result["log"] = None
-        json_path.write_text(json.dumps(result, indent=2) + "\n")
+        write_json(json_path, result)
         raise
 
     result |= sr.as_json()
     result["result"] = "PASS" if ok else "FAIL"
-    json_path.write_text(json.dumps(result, indent=2) + "\n")
+    write_json(json_path, result)
     if args.json:
         print(json.dumps(result))
     else:
@@ -1292,7 +1323,7 @@ def cmd_wait_ssh(args, name, bench) -> int:
     return 1
 
 
-def cmd_console(args, name, bench) -> int:
+def cmd_console(args, name, bench) -> NoReturn:
     if args.caller == "agent":
         raise BenchError("caller policy is 'agent': the raw console (tio) is refused")
     tio = shutil.which("tio")
@@ -1363,6 +1394,7 @@ def cmd_benches(args, cfg) -> int:
 # There is deliberately no tool for console, hold, wait-ssh or raw U-Boot.
 
 MCP_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+MCP_MAX_LINE = 1 << 20  # bytes per JSON-RPC message
 _BENCH = {"type": "string", "pattern": r"^[A-Za-z0-9_.-]{1,64}$",
           "description": "bench name (default: the configured default_bench)"}
 
@@ -1519,7 +1551,7 @@ class McpServer:
         f = conn.makefile("rwb")
         try:
             while not self._stop(stop):
-                line = f.readline(1 << 20)
+                line = f.readline(MCP_MAX_LINE)
                 if not line:
                     return
                 if not line.endswith(b"\n"):
