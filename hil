@@ -72,12 +72,20 @@ DEFAULT_STAGES = [
 DEFAULT_FAIL = [r"Kernel panic"]
 
 
-class BenchError(Exception):
+class HilError(Exception):
+    """Base for hil's own errors; `exit_code` is what the CLI exits with."""
+    exit_code = 2
+
+
+class BenchError(HilError):
     """Bench, config or infrastructure problem (exit 2)."""
+    exit_code = 2
 
 
-class BenchLocked(Exception):
-    """Another run holds the bench (exit 3)."""
+class BenchLocked(HilError):
+    """Another run holds the bench (exit 3). Not a BenchError on purpose:
+    callers must be able to tell "busy" from "broken"."""
+    exit_code = 3
 
 
 # --------------------------------------------------------------------- config
@@ -288,11 +296,8 @@ def run_recorded(name: str, args, fn, argv: list[str]) -> int:
     try:
         rc = fn()
         return rc
-    except BenchLocked as e:
-        rc, err = 3, str(e)
-        raise
-    except BenchError as e:
-        rc, err = 2, str(e)
+    except HilError as e:
+        rc, err = e.exit_code, str(e)
         raise
     except KeyboardInterrupt:
         rc, err = 130, "interrupted"
@@ -963,8 +968,9 @@ SHELL_SYNTAX_RX = re.compile(r"[;&|$'\"\\`#{}<>\n\r]")
 RAUC_VARS = ["BOOT_ORDER", "BOOT_A_LEFT", "BOOT_B_LEFT"]
 
 
-class UbootError(Exception):
+class UbootError(HilError):
     """The target did not reach / cooperate at the U-Boot shell (exit 1)."""
+    exit_code = 1
 
 
 def is_destructive(cmd: str) -> bool:
@@ -1639,12 +1645,9 @@ def dispatch(args, argv: list[str], cfg: dict | None = None, caller: str | None 
         if is_recorded(args):
             return run_recorded(name, args, lambda: fn(args, name, bench), argv)
         return fn(args, name, bench)
-    except BenchLocked as e:
+    except HilError as e:
         print(f"hil: {e}", file=sys.stderr)
-        return 3
-    except BenchError as e:
-        print(f"hil: {e}", file=sys.stderr)
-        return 2
+        return e.exit_code
     except KeyboardInterrupt:
         return 130
     except Exception:  # a bug in hil, never a target failure: exit 2, not 1

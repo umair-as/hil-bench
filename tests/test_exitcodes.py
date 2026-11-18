@@ -86,6 +86,15 @@ class ExitCodeTests(HilTestCase):
         self.assertEqual(rec["rc"], 2)
 
 
+class ErrorHierarchyTests(unittest.TestCase):
+    def test_exit_codes_live_on_the_exceptions(self):
+        self.assertEqual(hil.BenchError("x").exit_code, 2)
+        self.assertEqual(hil.BenchLocked("x").exit_code, 3)
+        self.assertEqual(hil.UbootError("x").exit_code, 1)
+        # "busy" must stay distinguishable from "broken"
+        self.assertFalse(issubclass(hil.BenchLocked, hil.BenchError))
+
+
 class ConfigValueTests(HilTestCase):
     """No fakes: values must be rejected before any plug request or port open
     (the harness turns real network/serial access into a test failure)."""
