@@ -29,12 +29,13 @@ class ProcLocksTests(HilTestCase):
                                   "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
                                   "fcntl.flock(fd, fcntl.LOCK_EX)\nprint('locked', flush=True)\ntime.sleep(30)\n",
                                   str(path)], stdout=subprocess.PIPE, text=True)
-        try:
-            self.assertEqual(child.stdout.readline().strip(), "locked")
-            self.assertEqual(hil.flock_holders(path), [child.pid])
-        finally:
-            child.kill()
-            child.wait()
+        with child:
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "locked")
+                self.assertEqual(hil.flock_holders(path), [child.pid])
+            finally:
+                child.kill()
+        self.assertTrue(child.stdout.closed)
         self.assertEqual(hil.flock_holders(path), [])
 
     def test_missing_file_has_no_holders(self):

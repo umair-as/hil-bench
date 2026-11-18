@@ -85,15 +85,16 @@ class PortCheckTests(HilTestCase):
                                   "fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY)\n"
                                   "fcntl.flock(fd, fcntl.LOCK_EX)\nprint('locked', flush=True)\ntime.sleep(30)\n",
                                   path], stdout=subprocess.PIPE, text=True)
-        try:
-            self.assertEqual(child.stdout.readline().strip(), "locked")
-            # Pretend /proc/<pid>/fd of that process is unreadable (other user).
-            with mock.patch.object(hil, "port_holders", lambda p: []):
-                busy = hil.port_busy(path)
-            self.assertTrue(any(str(child.pid) in b and "flock" in b for b in busy), busy)
-        finally:
-            child.kill()
-            child.wait()
+        with child:
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "locked")
+                # Pretend /proc/<pid>/fd of that process is unreadable (other user).
+                with mock.patch.object(hil, "port_holders", lambda p: []):
+                    busy = hil.port_busy(path)
+                self.assertTrue(any(str(child.pid) in b and "flock" in b for b in busy), busy)
+            finally:
+                child.kill()
+        self.assertTrue(child.stdout.closed)
 
     def test_ebusy_open_reported_as_exclusive_holder(self):
         import serial
