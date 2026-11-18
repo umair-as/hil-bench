@@ -28,7 +28,7 @@ carries the credentials in the URL query string.
 |---|---|
 | `hil benches` | list configured benches (`*` = default) |
 | `hil power status` | relay state + W / V / A / kWh today (no lock taken) |
-| `hil power on\|off\|cycle [--off-seconds N]` | relay control |
+| `hil power on\|off\|cycle [--off-seconds N] [--max-on S]` | relay control; `--max-on` arms the plug's own switch-off timer (see "Plug-side safety") |
 | `hil power watch [--interval S] [--duration S] [--csv F]` | sample W / V / A until the duration ends or Ctrl-C, then print avg/min/max W and Wh (no lock taken) |
 | `hil boot [--no-cycle] [--timeout S] [--log-dir D] [--json]` | power-cycle, watch the UART, time each boot stage, PASS/FAIL |
 | `hil boot --repeat N [--settle S]` | N cycles in a row (board kept up S s between runs); per-stage min/median/max/stdev, pass count |
@@ -225,6 +225,31 @@ Tasmota `PowerOnState` decides what the relay does after the plug loses mains.
 `3` (restore the last state) can leave a bench dark if it was off during an
 outage. For an unattended bench, `PowerOnState 1` (always on) is the usual
 choice.
+
+## Plug-side safety (opt-in)
+
+Two Tasmota features make the plug itself finish what the host started.
+Both are off by default. Set them per bench in `[benches.X.power]`:
+
+- **`cycle_on_plug = true`:** `power cycle`, `boot` and `uboot` send
+  `Backlog Power1 Off; Delay N; Power1 On` and let the plug run the cycle,
+  so it finishes even if the host dies halfway. `hil` polls the relay to
+  time the boot from the moment it closes (to about 0.1 s) and switches it
+  on from the host only as a fallback. The off time must be 0.2–360 s
+  (Tasmota `Delay` limits).
+- **`max_on_seconds = S`:** a dead-man for unattended runs. Before every
+  switch-on (`power on`, `power cycle`, `boot`, `uboot`), `hil` sets the
+  plug's `PulseTime` so the plug switches itself off S seconds later, with
+  or without the host. `power off` clears it again. `power on --max-on S`
+  sets it for one call (`--max-on 0` clears it), even on a bench without
+  the setting. Pick S longer than the whole run: a `boot --repeat` series
+  re-arms it on every cycle, but `--settle` time counts too.
+
+`PulseTime` is stored on the plug and also applies when someone presses the
+plug's button. Without either setting or flag, `hil` never touches it.
+Both features depend on documented Tasmota behaviour that hasn't been
+checked against a real plug by `hil`'s tests; try them on a bench before
+relying on them.
 
 ## License
 

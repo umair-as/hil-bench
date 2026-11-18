@@ -23,6 +23,8 @@ host = "192.0.2.10"                 # plug IP
 creds_file = "~/.config/tasmota"    # TASMOTA_USER= / TASMOTA_PASS= lines
 relay = 1
 off_seconds = 5                     # let the PSU caps drain
+# cycle_on_plug = true              # plug runs Off; Delay; On itself (README "Plug-side safety")
+# max_on_seconds = 3600             # plug switches itself off 1 h after each switch-on
 
 [benches.rpi5.serial]
 # Use the stable /dev/serial/by-id path, not ttyACMn.

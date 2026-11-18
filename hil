@@ -6,7 +6,7 @@ power-cycle a target, capture its boot console, and assert it reached a
 login prompt. Machine-specific values live in ~/.config/hil-bench/benches.toml,
 never in this tool.
 
-    hil [-b BENCH] power status|on|off|cycle
+    hil [-b BENCH] power status|on|off|cycle [--off-seconds S] [--max-on S]
     hil power watch [--interval S] [--duration S] [--csv FILE]
     hil boot   [--no-cycle] [--repeat N] [--power-interval S] [--timeout S] [--log-dir DIR] [--json]
     hil uboot  env|slot A|B|reset-counters|run -c CMD...|shell  [--then boot|stay|reset]
@@ -280,10 +280,26 @@ def run_recorded(name: str, args, fn) -> int:
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def pulsetime_value(seconds: float) -> int:
+    """Tasmota PulseTime encoding: 1..111 = 0.1 s steps, 112..64900 = value-100 s."""
+    if not (math.isfinite(seconds) and 0.1 <= seconds <= 64800):
+        raise BenchError("max-on time must be 0.1..64800 seconds (Tasmota PulseTime)")
+    return max(1, round(seconds * 10)) if seconds <= 11.1 else round(seconds) + 100
+
+
 class Tasmota:
     def __init__(self, conf: dict):
         self.host = conf["host"]
         self.relay = int(conf.get("relay", 1))
+        # Both off by default; see README "Plug-side safety".
+        self.plug_cycle = conf.get("cycle_on_plug", False)
+        if not isinstance(self.plug_cycle, bool):
+            raise BenchError("[power] cycle_on_plug must be true or false")
+        self.max_on = conf.get("max_on_seconds")
+        if self.max_on is not None:
+            if isinstance(self.max_on, bool) or not isinstance(self.max_on, (int, float)):
+                raise BenchError("[power] max_on_seconds must be a number of seconds")
+            pulsetime_value(self.max_on)
         self.user, self.password = self._creds(conf)
 
     @staticmethod
@@ -329,6 +345,12 @@ class Tasmota:
     def power(self, action: str | None = None) -> str:
         return self._state(self.cmd(f"Power{self.relay}" + (f" {action}" if action else "")))
 
+    def set_max_on(self, seconds: float | None) -> None:
+        """Arm (or with 0/None clear) the plug's own switch-off timer, which
+        runs from every switch-on until cleared, even if the host is gone."""
+        value = pulsetime_value(seconds) if seconds else 0
+        self.cmd(f"PulseTime{self.relay} {value}")
+
     def energy(self) -> dict:
         e = self.cmd("Status 8").get("StatusSNS", {}).get("ENERGY", {})
         return {"watts": e.get("Power"), "volts": e.get("Voltage"), "amps": e.get("Current"),
@@ -346,9 +368,59 @@ def make_power(bench: dict):
     raise BenchError(f"unsupported power type: {kind!r}")
 
 
-def power_cycle(psu, off_seconds: float, while_off=None) -> float:
+def arm_max_on(psu, override: float | None = None) -> None:
+    """Set the plug's dead-man (PulseTime) before a switch-on: the --max-on
+    value if given (0 clears it), else the bench's max_on_seconds. Without
+    either, the plug's setting is left alone."""
+    secs = override if override is not None else getattr(psu, "max_on", None)
+    if secs is not None:
+        psu.set_max_on(secs)
+
+
+# Extra time the plug gets, beyond the off time, to open and close the relay
+# during a plug-side cycle.
+PLUG_CYCLE_GRACE = 10.0
+
+
+def wait_relay(psu, state: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if psu.power() == state:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def plug_side_cycle(psu, off_seconds: float, while_off=None) -> float:
+    """Let the plug run Off; Delay; On itself (Backlog), so the cycle finishes
+    even if the host dies halfway. The host polls the relay to time t0 (to
+    about one poll, 0.05 s plus the HTTP round trip) and switches it on
+    itself only as a fallback."""
+    if not 0.2 <= off_seconds <= 360:
+        raise BenchError("plug-side cycle: off time must be 0.2..360 s (Tasmota Delay)")
+    r, t_on = psu.relay, None
+    try:
+        psu.cmd(f"Backlog Power{r} Off; Delay {round(off_seconds * 10)}; Power{r} On")
+        if not wait_relay(psu, "OFF", PLUG_CYCLE_GRACE):
+            raise BenchError("plug-side cycle: never saw the relay open")
+        if while_off:
+            while_off()
+        if wait_relay(psu, "ON", off_seconds + PLUG_CYCLE_GRACE):
+            t_on = time.monotonic()
+    finally:
+        if t_on is None:
+            state = psu.power("On")  # fallback: never leave the board dark
+    if t_on is None:
+        raise BenchError(f"plug-side cycle: relay did not close in time (host fallback: {state})")
+    return t_on
+
+
+def power_cycle(psu, off_seconds: float, while_off=None, max_on: float | None = None) -> float:
     """Off, wait, on. Returns the monotonic time the relay closed.
     while_off runs with the relay open (e.g. to drop the old run's UART bytes)."""
+    arm_max_on(psu, max_on)
+    if getattr(psu, "plug_cycle", False):
+        return plug_side_cycle(psu, off_seconds, while_off)
     try:
         # Inside the try: if the relay opened but the reply was lost, the
         # finally still closes it again.
@@ -493,6 +565,11 @@ def log_paths(log_dir: str | None, name: str, kind: str) -> tuple[Path, Path]:
 
 def cmd_power(args, name, bench) -> int:
     check_interval(args.off_seconds, "--off-seconds")
+    if args.max_on is not None:
+        if args.action not in ("on", "cycle"):
+            raise BenchError("--max-on only applies to power on and power cycle")
+        if args.max_on != 0:
+            pulsetime_value(args.max_on)
     psu = make_power(bench)
     if args.action == "status":
         print(json.dumps(psu.status()))
@@ -502,10 +579,16 @@ def cmd_power(args, name, bench) -> int:
     with bench_lock(name, f"power {args.action}"):
         if args.action == "cycle":
             off = args.off_seconds if args.off_seconds is not None else float(bench["power"].get("off_seconds", 5))
-            power_cycle(psu, off)
+            power_cycle(psu, off, max_on=args.max_on)
             print(json.dumps({"relay": "ON", "cycled_off_seconds": off}))
+        elif args.action == "on":
+            arm_max_on(psu, args.max_on)
+            print(json.dumps({"relay": psu.power("On")}))
         else:
-            print(json.dumps({"relay": psu.power(args.action.capitalize())}))
+            state = psu.power("Off")
+            if getattr(psu, "max_on", None) is not None:
+                psu.set_max_on(0)  # disarm, so a later plain "on" isn't cut
+            print(json.dumps({"relay": state}))
     return 0
 
 
@@ -1124,6 +1207,8 @@ def main() -> int:
     p = sub.add_parser("power", help="relay control and energy reading")
     p.add_argument("action", choices=["status", "on", "off", "cycle", "watch"])
     p.add_argument("--off-seconds", type=float)
+    p.add_argument("--max-on", type=float, metavar="S",
+                   help="on/cycle: the plug switches itself off after S s (PulseTime dead-man; 0 clears it)")
     p.add_argument("--interval", type=float, default=1.0, help="watch: seconds between samples")
     p.add_argument("--duration", type=float, help="watch: stop after S seconds (default: Ctrl-C)")
     p.add_argument("--csv", help="watch: also write samples to this CSV file")

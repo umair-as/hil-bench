@@ -302,5 +302,5 @@ def ns(**kw):
     base = dict(no_cycle=False, repeat=1, settle=0.0, power_interval=None, timeout=None,
                 log_dir=None, json=True, slot=None, commands=[], then="stay", attempts=3,
                 stop_string=None, allow_destructive=False, prompt_timeout=5, cmd_timeout=3,
-                off_seconds=None, interval=1.0, duration=None, csv=None, caller="human")
+                off_seconds=None, interval=1.0, duration=None, csv=None, caller="human", max_on=None)
     return argparse.Namespace(**(base | kw))
