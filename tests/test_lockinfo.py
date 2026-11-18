@@ -52,7 +52,7 @@ class LockCommandTests(HilTestCase):
         info = json.loads(out)
         self.assertEqual(info["bench"], "t")
         self.assertFalse(info["held"])
-        self.assertEqual(info["lock"], str(hil.STATE / "t.lock"))
+        self.assertEqual(info["lock"], str(hil.PATHS.state / "t.lock"))
 
     def test_held_bench_reports_holder(self):
         with hil.bench_lock("t", "boot"):

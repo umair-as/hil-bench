@@ -35,7 +35,7 @@ class HoldTests(HilTestCase):
                 "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
                 "try:\n    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\nexcept BlockingIOError:\n    sys.exit(42)\n"
                 "sys.exit(0)\n")
-        rc, _, _ = self.run_main("hold", "--", PY, "-c", code, str(hil.STATE / "t.lock"))
+        rc, _, _ = self.run_main("hold", "--", PY, "-c", code, str(hil.PATHS.state / "t.lock"))
         self.assertEqual(rc, 42)
 
     def test_other_callers_refused_while_held(self):
@@ -50,7 +50,7 @@ class HoldTests(HilTestCase):
         code = "import sys; print(open(sys.argv[1]).read())"
         out_file = self.tmp / "holder.txt"
         code = f"import sys; open({str(out_file)!r}, 'w').write(open(sys.argv[1]).read())"
-        self.run_main("hold", "--", PY, "-c", code, str(hil.STATE / "t.lock"))
+        self.run_main("hold", "--", PY, "-c", code, str(hil.PATHS.state / "t.lock"))
         self.assertIn("(hold: ", out_file.read_text())
 
     def test_child_env_names_bench_and_lock_fd(self):
@@ -83,7 +83,7 @@ class NestedLockTests(HilTestCase):
         # Someone else holds the lock; a caller that opens the lock file itself
         # and claims that fd must still be refused.
         with hil.bench_lock("t", "hold: x"):
-            own = os.open(hil.STATE / "t.lock", os.O_RDONLY)
+            own = os.open(hil.PATHS.state / "t.lock", os.O_RDONLY)
             try:
                 os.environ["HIL_LOCK_FD"] = str(own)
                 with self.assertRaises(hil.BenchLocked):

@@ -14,7 +14,7 @@ class ActionLogTests(HilTestCase):
         self.use_fakes(None, self.plug)
 
     def records(self):
-        p = hil.STATE / "actions.jsonl"
+        p = hil.PATHS.state / "actions.jsonl"
         return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
 
     def test_power_on_logged_start_and_end(self):
@@ -48,8 +48,8 @@ class ActionLogTests(HilTestCase):
         self.assertEqual(self.records()[-1]["rc"], 2)
 
     def test_unwritable_log_refuses_the_action(self):
-        hil.STATE.mkdir(parents=True, exist_ok=True)
-        (hil.STATE / "actions.jsonl").mkdir()  # can't be opened as a file
+        hil.PATHS.state.mkdir(parents=True, exist_ok=True)
+        (hil.PATHS.state / "actions.jsonl").mkdir()  # can't be opened as a file
         rc, _, err = self.run_main("power", "on")
         self.assertEqual(rc, 2)
         self.assertIn("action log", err)

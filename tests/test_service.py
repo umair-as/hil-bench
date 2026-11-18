@@ -29,8 +29,8 @@ class PathConfigTests(HilTestCase):
     def test_defaults_without_paths(self):
         self.write_config(TEST_CONFIG)
         rc, out, _ = self.run_main("lock")
-        self.assertEqual(json.loads(out)["lock"], str(hil.STATE / "t.lock"))
-        self.assertEqual(hil.default_log_dir(), hil.STATE / "logs")
+        self.assertEqual(json.loads(out)["lock"], str(hil.PATHS.state / "t.lock"))
+        self.assertEqual(hil.default_log_dir(), hil.PATHS.state / "logs")
 
     def test_lock_dir_defaults_to_state_dir(self):
         self.write_config(TEST_CONFIG + f'[paths]\nstate_dir = "{self.tmp}/s"\n')
@@ -42,6 +42,12 @@ class PathConfigTests(HilTestCase):
         rc, _, err = self.run_main("lock")
         self.assertEqual(rc, 2)
         self.assertIn("absolute", err)
+
+    def test_bad_paths_entry_changes_nothing(self):
+        before = hil.Paths(**vars(hil.PATHS))
+        with self.assertRaisesRegex(hil.BenchError, "absolute"):
+            hil.apply_paths({"paths": {"state_dir": f"{self.tmp}/s", "log_dir": "relative/logs"}})
+        self.assertEqual(hil.PATHS, before)
 
     def test_unknown_paths_key_refused(self):
         self.write_config(TEST_CONFIG + '[paths]\nstat_dir = "/x"\n')

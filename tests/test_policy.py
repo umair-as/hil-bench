@@ -37,7 +37,7 @@ class CallerPolicyTests(HilTestCase):
         from harness import FakePlug
         self.use_fakes(None, FakePlug())
         self.run_main("power", "on")
-        rec = json.loads((hil.STATE / "actions.jsonl").read_text().splitlines()[0])
+        rec = json.loads((hil.PATHS.state / "actions.jsonl").read_text().splitlines()[0])
         self.assertEqual(rec["caller"], "agent")
 
 

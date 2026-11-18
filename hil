@@ -56,13 +56,32 @@ from pathlib import Path
 from typing import NamedTuple
 
 CONFIG = Path(os.environ.get("HIL_BENCH_CONFIG", "~/.config/hil-bench/benches.toml")).expanduser()
-STATE = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "hil-bench"
-# Overridden by the config's [paths] table (apply_paths), e.g. to share one
-# state/lock/log location owned by a service user.
-LOCK_DIR: Path | None = None    # default: STATE
-LOG_DIR: Path | None = None     # default: STATE / "logs"
-CREDS_FILE: str | None = None   # default plug creds_file for benches without one
-PATH_KEYS = ("state_dir", "lock_dir", "log_dir", "creds_file")
+
+
+@dataclass
+class Paths:
+    """Where hil keeps its state. The config's [paths] table overrides these
+    (apply_paths), e.g. to share one location owned by a service user."""
+    state: Path                 # action log; default home of locks and logs
+    lock: Path | None = None    # <bench>.lock files (default: state)
+    log: Path | None = None     # default --log-dir (default: state/logs)
+    creds: str | None = None    # plug creds_file for benches without one
+
+    @property
+    def lock_dir(self) -> Path:
+        return self.lock or self.state
+
+    @property
+    def log_dir(self) -> Path:
+        return self.log or self.state / "logs"
+
+    @property
+    def actions(self) -> Path:
+        return self.state / "actions.jsonl"
+
+
+PATHS = Paths(state=Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "hil-bench")
+PATH_KEYS = {"state_dir": "state", "lock_dir": "lock", "log_dir": "log", "creds_file": "creds"}
 
 # Board-agnostic defaults: anything Linux prints whatever boots it.
 # Bootloader stages (EEPROM, U-Boot, UEFI) and image checks (FIT signatures)
@@ -124,8 +143,8 @@ def compile_patterns(patterns, where: str, flags: int = re.M) -> list[re.Pattern
 
 
 def apply_paths(cfg: dict) -> None:
-    """Take state, lock, log and default creds locations from [paths]."""
-    global STATE, LOCK_DIR, LOG_DIR, CREDS_FILE
+    """Take state, lock, log and default creds locations from [paths].
+    Only the keys given there change PATHS."""
     paths = cfg.get("paths") or {}
     unknown = set(paths) - set(PATH_KEYS)
     if unknown:
@@ -135,19 +154,13 @@ def apply_paths(cfg: dict) -> None:
         p = Path(str(val)).expanduser()
         if not p.is_absolute():
             raise BenchError(f"[paths] {key} must be an absolute path, got {val!r}")
-        resolved[key] = p
-    if "state_dir" in resolved:
-        STATE = resolved["state_dir"]
-    if "lock_dir" in resolved:
-        LOCK_DIR = resolved["lock_dir"]
-    if "log_dir" in resolved:
-        LOG_DIR = resolved["log_dir"]
-    if "creds_file" in resolved:
-        CREDS_FILE = str(resolved["creds_file"])
+        resolved[PATH_KEYS[key]] = str(p) if key == "creds_file" else p
+    for attr, val in resolved.items():  # validate everything before changing anything
+        setattr(PATHS, attr, val)
 
 
 def default_log_dir() -> Path:
-    return LOG_DIR or STATE / "logs"
+    return PATHS.log_dir
 
 
 def get_bench(cfg: dict, name: str | None) -> tuple[str, dict]:
@@ -186,7 +199,7 @@ def flock_holders(path: Path | str, proc_locks: str | None = None) -> list[int]:
 
 
 def lock_path(name: str) -> Path:
-    return (LOCK_DIR or STATE) / f"{name}.lock"
+    return PATHS.lock_dir / f"{name}.lock"
 
 
 def inherited_lock(path: Path) -> int | None:
@@ -276,10 +289,10 @@ def current_user() -> str:
 
 
 def append_action(record: dict) -> None:
-    path = STATE / "actions.jsonl"
+    path = PATHS.actions
     line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
     try:
-        STATE.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
             os.write(fd, line)  # one write per line: O_APPEND keeps lines whole
@@ -349,7 +362,7 @@ class Tasmota:
     @staticmethod
     def _creds(conf: dict) -> tuple[str, str]:
         env = {}
-        creds = conf.get("creds_file") or CREDS_FILE
+        creds = conf.get("creds_file") or PATHS.creds
         if creds:
             p = Path(creds).expanduser()
             if not p.exists():

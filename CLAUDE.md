@@ -37,10 +37,11 @@ template. IPs, serial IDs and credential paths stay out of the repo.
 
 - **Config → bench:** `load_config` + `get_bench` select a bench from
   `-b`, `HIL_BENCH`, or `default_bench`. Every `cmd_*` takes `(args, name, bench)`.
-  `apply_paths` takes `STATE`, `LOCK_DIR`, `LOG_DIR` and a default
-  `CREDS_FILE` from the config's `[paths]` (service-user setup,
-  `docs/service-user.md`). Use `lock_path()` / `default_log_dir()`, not
-  `STATE` directly.
+  All locations live in one `Paths` object, `PATHS` (state, lock dir, log
+  dir, default plug creds). `apply_paths` sets the fields the config's
+  `[paths]` gives (service-user setup, `docs/service-user.md`) after
+  validating all of them. Read `PATHS.lock_dir` / `PATHS.log_dir` /
+  `PATHS.actions` (or `lock_path()`); tests patch `hil.PATHS`.
 - **Power:** `make_power` dispatches on `power.type`. Only `Tasmota` exists:
   it uses the HTTP `/cm` API with credentials from `creds_file` or
   `TASMOTA_USER`/`TASMOTA_PASS`. They go through urllib (never a proxy) and

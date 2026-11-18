@@ -76,7 +76,7 @@ class McpTests(HilTestCase):
         res = self.call("power", bench="t", action="on")
         self.assertFalse(res["isError"], res)
         self.assertEqual(self.plug.state, "ON")
-        recs = [json.loads(l) for l in (hil.STATE / "actions.jsonl").read_text().splitlines()]
+        recs = [json.loads(l) for l in (hil.PATHS.state / "actions.jsonl").read_text().splitlines()]
         self.assertEqual(recs[0]["caller"], "agent")
         self.assertEqual(recs[0]["via"], "mcp")
 

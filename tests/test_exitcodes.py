@@ -111,7 +111,7 @@ class ExitCodeTests(HilTestCase):
         self.assertEqual(rc, 2)
         self.assertIn("internal error", err)
         self.assertIn("surprise", err)
-        rec = json.loads((hil.STATE / "actions.jsonl").read_text().splitlines()[-1])
+        rec = json.loads((hil.PATHS.state / "actions.jsonl").read_text().splitlines()[-1])
         self.assertEqual(rec["rc"], 2)
 
 
