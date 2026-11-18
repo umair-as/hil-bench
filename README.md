@@ -22,6 +22,15 @@ line, so they don't show up in `ps` or in logs. Requests to the plug always
 go direct and ignore `http_proxy`/`HTTP_PROXY`, because the plug's `/cm` API
 carries the credentials in the URL query string.
 
+> **Plug security.** Tasmota's `/cm` API is plain HTTP and takes the
+> credentials as URL query parameters, so anyone who can see the bench
+> network traffic can read them. `hil` can't change that; it's how the plug
+> works. Keep the plugs on an isolated bench network (VLAN) that only the
+> bench host can reach. Use a password that isn't used anywhere else, and
+> keep `creds_file` readable only by the user that runs `hil`. The plug
+> credentials are admin access: they can also change rules, scripts, the
+> OTA URL and `PowerOnState`.
+
 ## Commands
 
 | Command | Does |
