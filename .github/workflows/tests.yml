@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    name: offline suite (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]  # 3.11 is the minimum (tomllib)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install pyserial
+        run: python -m pip install --disable-pip-version-check pyserial
+
+      - name: Compile and CLI smoke test
+        run: |
+          python -m py_compile hil
+          ./hil --help > /dev/null
+
+      - name: Example config parses
+        run: python -c "import tomllib; tomllib.load(open('examples/benches.toml.example', 'rb'))"
+
+      # No hardware here: the harness fakes serial, plug and U-Boot, and any
+      # real network or serial access in a test fails.
+      - name: Offline test suite
+        run: python -m unittest discover -s tests -v

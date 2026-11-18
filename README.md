@@ -10,7 +10,7 @@
 [![Power](https://img.shields.io/badge/power-Tasmota%20plug-00a7e1.svg)](https://tasmota.github.io/docs/)
 [![U-Boot](https://img.shields.io/badge/recovery-U--Boot%20%2B%20RAUC-green.svg)](https://rauc.io/)
 [![MCP](https://img.shields.io/badge/agents-MCP%20server-8a2be2.svg)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-offline%2C%20no%20hardware-success.svg)](tests/)
+[![tests](https://github.com/umair-as/hil-bench/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/umair-as/hil-bench/actions/workflows/tests.yml)
 
 </div>
 

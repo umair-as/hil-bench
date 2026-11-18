@@ -114,7 +114,7 @@ template. IPs, serial IDs and credential paths stay out of the repo.
 
 ## Checking changes
 
-There is no linter. The offline test suite needs no hardware: it loads `hil`
+There is no linter. CI (`.github/workflows/tests.yml`) runs the offline suite on Python 3.11 and 3.12 for every push to `main` and every pull request. The offline test suite needs no hardware: it loads `hil`
 with `SourceFileLoader`, gives every test a throwaway config and state
 directory, fakes the serial port, the plug and a U-Boot shell
 (`tests/harness.py`), and makes any real network or serial access raise.
