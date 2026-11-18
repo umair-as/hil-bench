@@ -175,5 +175,27 @@ hardware that other sessions or agents may be using. Before running them:
   the Backlog/Delay finding, features it doesn't use yet). Keep it generic:
   no as-found state of a particular unit (addresses, readings, dates).
 
-Commit messages use Conventional Commits with a scope, e.g.
-`feat(hil): …`, `docs(nous-a8t): …`.
+## Branches and the live working copy
+
+The main checkout of this repo is usually what `hil` on the bench host runs
+(e.g. via a `~/.local/bin/hil` symlink), and other sessions call it too. So:
+
+- Never leave a feature branch checked out in the main checkout, and don't
+  edit `hil` there while you work. Do branch work in a separate worktree:
+  `git worktree add ../hil-bench-<topic> -b <branch> main`.
+- Merge to `main` only when the branch is done and its checks pass
+  (fast-forward), then remove the worktree and the branch.
+- Don't push unless the operator asks.
+
+## Commit style
+
+- Conventional Commits with a scope: `feat(hil): …`, `fix(hil): …`,
+  `test(hil): …`, `docs(nous-a8t): …`, `ci: …`.
+- One logical change per commit, with its tests in the same commit.
+- A body after the subject: what was wrong or missing and why this change
+  fixes it, in plain sentences. Behaviour changes users will notice
+  (exit codes, refused options, JSON keys) are spelled out.
+- An AI agent that wrote or co-wrote the commit ends the message with a
+  trailer naming itself, e.g. `Co-Authored-By: <Agent> (<model>) <noreply address>`.
+- No local paths, host names, IPs, adapter IDs, other projects or private
+  notes in messages (the repo is public).
