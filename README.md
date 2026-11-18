@@ -36,6 +36,7 @@ carries the credentials in the URL query string.
 | `hil uboot env\|slot A\|B\|reset-counters\|run -c CMD…\|shell` | stop autoboot, inspect/repair the U-Boot env (see below) |
 | `hil wait-ssh [--host H] [--timeout S]` | wait for the sshd banner |
 | `hil console [--log-dir D]` | interactive `tio` with logging |
+| `hil lock` | who holds the bench lock, as JSON (read-only, never takes the lock) |
 | `hil hold -- CMD [ARGS…]` | run CMD (flasher, installer, test script) under the bench lock; exits with CMD's code |
 
 Select a bench with `-b NAME`, `HIL_BENCH`, or `default_bench`.
@@ -148,7 +149,9 @@ again, required or not. `--then stay` leaves the board at the prompt, and
 
 - **One user at a time.** `power on/off/cycle`, `boot` and `uboot` hold
   `~/.local/state/hil-bench/<bench>.lock`. A second caller gets exit `3` and
-  the holder's pid and command.
+  the holder's pid and command. Other tools can honour the same lock; the
+  protocol (path, `flock(2)`, holder line) is in
+  [`docs/bench-lock.md`](docs/bench-lock.md).
 - **One reader on the UART.** A tty has no fan-out, so two readers each get
   part of the bytes. `hil boot` and `hil console` refuse if anything already
   has the port open (and name the process). Before running, close any MCP

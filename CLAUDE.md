@@ -110,6 +110,8 @@ the serial port before running them.
 
 - `README.md`: user-facing command reference. Keep its tables in sync with
   the argparse definitions in `main()`.
+- `docs/bench-lock.md`: the lock protocol other tools follow. Keep it in
+  sync with `bench_lock`, `inherited_lock` and `flock_holders`.
 - `docs/nous-a8t.md`: notes on the bench smart plug (Tasmota settings applied,
   open items, plug features `hil` doesn't use yet).
 
