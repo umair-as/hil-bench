@@ -90,6 +90,9 @@ Select a bench with `-b NAME`, `HIL_BENCH`, or `default_bench`.
 
 Exit codes: `0` pass, `1` target failed (stage missing, fail pattern,
 ssh down), `2` bench/config/infra error, `3` bench locked by another run.
+`1` only ever means the target failed: a config mistake (bad TOML, bad
+regex, wrong value type), a serial adapter that drops out, or a bug in
+`hil` itself (printed as "internal error" with a traceback) exits `2`.
 
 ### ✅ Typical gate after flashing or an OTA install
 

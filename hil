@@ -47,6 +47,7 @@ import sys
 import threading
 import time
 import tomllib
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -84,8 +85,32 @@ class BenchLocked(Exception):
 def load_config() -> dict:
     if not CONFIG.exists():
         raise BenchError(f"no bench config at {CONFIG} (copy examples/benches.toml.example)")
-    with CONFIG.open("rb") as f:
-        return tomllib.load(f)
+    try:
+        with CONFIG.open("rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise BenchError(f"{CONFIG}: {e}") from None
+
+
+def conf_number(table: dict, key: str, default, where: str, kind: type = float):
+    """A number from a config table, or BenchError naming the key (exit 2)."""
+    val = table.get(key, default)
+    if isinstance(val, bool) or not isinstance(val, (int, float)) or (kind is int and not isinstance(val, int)):
+        raise BenchError(f"{where} {key} must be {'an integer' if kind is int else 'a number'}, got {val!r}")
+    return kind(val)
+
+
+def compile_patterns(patterns, where: str, flags: int = re.M) -> list[re.Pattern]:
+    """Regexes from the config, or BenchError naming the bad one (exit 2)."""
+    if not isinstance(patterns, list) or not all(isinstance(x, str) for x in patterns):
+        raise BenchError(f"{where} must be a list of regex strings")
+    compiled = []
+    for i, pat in enumerate(patterns):
+        try:
+            compiled.append(re.compile(pat, flags))
+        except re.error as e:
+            raise BenchError(f"{where}[{i}] {pat!r}: {e}") from None
+    return compiled
 
 
 def apply_paths(cfg: dict) -> None:
@@ -194,12 +219,18 @@ def bench_lock(name: str, what: str):
     Yields the lock's fd. Inside `hil hold`, the inherited lock is reused:
     nothing is rewritten and nothing is released on exit."""
     path = lock_path(name)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise BenchError(f"cannot create the lock directory {path.parent}: {e}") from None
     nested = inherited_lock(path)
     if nested is not None:
         yield nested
         return
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        raise BenchError(f"cannot open the bench lock {path}: {e}") from None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -267,7 +298,7 @@ def run_recorded(name: str, args, fn, argv: list[str]) -> int:
         rc, err = 130, "interrupted"
         raise
     except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+        rc, err = 2, f"{type(e).__name__}: {e}"
         raise
     finally:
         end = {"ts": now_iso(), "event": "end"} | rec | {"rc": rc} | ({"error": err} if err else {})
@@ -293,8 +324,10 @@ def pulsetime_value(seconds: float) -> int:
 
 class Tasmota:
     def __init__(self, conf: dict):
-        self.host = conf["host"]
-        self.relay = int(conf.get("relay", 1))
+        self.host = conf.get("host")
+        if not isinstance(self.host, str) or not self.host:
+            raise BenchError("[power] host is missing")
+        self.relay = conf_number(conf, "relay", 1, "[power]", int)
         # Both off by default; see README "Plug-side safety".
         self.plug_cycle = conf.get("cycle_on_plug", False)
         if not isinstance(self.plug_cycle, bool):
@@ -366,6 +399,8 @@ class Tasmota:
 
 def make_power(bench: dict):
     conf = bench.get("power") or {}
+    if not conf:
+        raise BenchError("bench has no [power] table")
     kind = conf.get("type")
     if kind == "tasmota":
         return Tasmota(conf)
@@ -550,13 +585,13 @@ def open_serial(bench: dict):
     except ImportError:
         raise BenchError("pyserial not installed (python3 -m pip install --user pyserial)") from None
     port = serial_path(bench)
+    baud = conf_number(bench.get("serial") or {}, "baud", 115200, "[serial]", int)
     if not os.path.exists(port):
         raise BenchError(f"serial port {port} not present")
     holders = port_busy(port)
     if holders:
         raise BenchError(f"{port} already open by {', '.join(holders)}; close it first "
                          "(serial_close for the MCP server, quit tio)")
-    baud = int(bench["serial"].get("baud", 115200))
     try:
         return serial.Serial(port, baud, timeout=0.2, exclusive=True)
     except serial.SerialException as e:
@@ -592,7 +627,8 @@ def cmd_power(args, name, bench) -> int:
         return power_watch(args, psu)
     with bench_lock(name, f"power {args.action}"):
         if args.action == "cycle":
-            off = args.off_seconds if args.off_seconds is not None else float(bench["power"].get("off_seconds", 5))
+            off = (args.off_seconds if args.off_seconds is not None
+                   else conf_number(bench.get("power") or {}, "off_seconds", 5, "[power]"))
             power_cycle(psu, off, max_on=args.max_on, plug_side=True)
             print(json.dumps({"relay": "ON", "cycled_off_seconds": off}))
         elif args.action == "on":
@@ -671,7 +707,10 @@ class Console:
         return round(time.monotonic() - self.t0, 2)
 
     def pump(self) -> str:
-        chunk = self.ser.read(4096)
+        try:
+            chunk = self.ser.read(4096)
+        except OSError as e:  # pyserial's SerialException is one: adapter unplugged or reset
+            raise BenchError(f"serial read failed: {e}") from None
         if not chunk:
             return ""
         self.log.write(chunk)
@@ -686,8 +725,11 @@ class Console:
         # Paced: the U-Boot UART has a small RX FIFO and no flow control.
         raw = data.encode()
         for i in range(0, len(raw), 8):
-            self.ser.write(raw[i:i + 8])
-            self.ser.flush()
+            try:
+                self.ser.write(raw[i:i + 8])
+                self.ser.flush()
+            except OSError as e:
+                raise BenchError(f"serial write failed: {e}") from None
             time.sleep(0.01)
 
     def expect(self, rx: re.Pattern, timeout: float, start: int | None = None):
@@ -707,9 +749,16 @@ class Console:
 def stage_config(bench: dict, timeout: float | None):
     boot = bench.get("boot") or {}
     stages = boot.get("stages") or DEFAULT_STAGES
-    compiled = [(s["name"], re.compile(s["pattern"], re.M), bool(s.get("optional"))) for s in stages]
+    if not isinstance(stages, list):
+        raise BenchError("[boot] stages must be a list of tables")
+    compiled = []
+    for i, st in enumerate(stages):
+        if not (isinstance(st, dict) and isinstance(st.get("name"), str) and isinstance(st.get("pattern"), str)):
+            raise BenchError(f"[boot] stages[{i}] needs a name and a pattern")
+        (rx,) = compile_patterns([st["pattern"]], f"[boot] stages[{i}] ({st['name']}) pattern")
+        compiled.append((st["name"], rx, bool(st.get("optional"))))
     # re.M for both lists, so ^ and $ mean line start/end everywhere.
-    fails = [re.compile(p, re.M) for p in boot.get("fail_patterns", DEFAULT_FAIL)]
+    fails = compile_patterns(boot.get("fail_patterns", DEFAULT_FAIL), "[boot] fail_patterns")
     return compiled, fails, timeout or float(boot.get("timeout", 180))
 
 
@@ -782,7 +831,7 @@ def start_console(args, name, bench, ser, log) -> Console:
     if args.no_cycle:
         ser.reset_input_buffer()
         return Console(ser, log, time.monotonic())
-    off = float(bench["power"].get("off_seconds", 5))
+    off = conf_number(bench.get("power") or {}, "off_seconds", 5, "[power]")
     # Clear while the relay is open, so the previous run's tail can't leak in.
     return Console(ser, log, power_cycle(make_power(bench), off, ser.reset_input_buffer))
 
@@ -942,7 +991,9 @@ def agent_command_refusal(cmd: str, allow: list[str]) -> str | None:
 def uboot_interrupt(con: Console, bench: dict, stop: str | None, timeout: float) -> dict:
     """Catch the autoboot countdown and stop it. Returns what was seen."""
     conf = bench.get("uboot") or {}
-    too_late = re.compile("|".join(TOO_LATE_DEFAULT + conf.get("too_late_patterns", [])))
+    extra = conf.get("too_late_patterns", [])
+    compile_patterns(extra, "[uboot] too_late_patterns", 0)  # names the bad one
+    too_late = re.compile("|".join(TOO_LATE_DEFAULT + extra))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         m = AUTOBOOT_RX.search(con.buf)
@@ -1173,7 +1224,7 @@ def cmd_console(args, name, bench) -> int:
         raise BenchError(f"{port} already open by {', '.join(holders)}")
     log_dir = Path(args.log_dir).expanduser() if args.log_dir else default_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
-    baud = str(bench["serial"].get("baud", 115200))
+    baud = str(conf_number(bench.get("serial") or {}, "baud", 115200, "[serial]", int))
     os.execv(tio, [tio, "-b", baud, "--log", "--log-directory", str(log_dir), port])
 
 
@@ -1590,6 +1641,10 @@ def dispatch(args, argv: list[str], cfg: dict | None = None, caller: str | None 
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception:  # a bug in hil, never a target failure: exit 2, not 1
+        traceback.print_exc()
+        print("hil: internal error (a bug in hil, not a target failure)", file=sys.stderr)
+        return 2
 
 
 def main() -> int:

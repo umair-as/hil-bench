@@ -111,6 +111,9 @@ template. IPs, serial IDs and credential paths stay out of the repo.
   `--allow-destructive`.
 - **Exit codes:** `0` pass, `1` target failed a check (`UbootError` too),
   `2` bench/config/infra error (`BenchError`), `3` bench locked (`BenchLocked`).
+  Config values go through `conf_number`/`compile_patterns`, serial I/O errors in
+  `Console` become `BenchError`, and `dispatch` maps any other exception to `2`
+  ("internal error" plus traceback), so `1` always means the target failed.
 
 ## Checking changes
 
