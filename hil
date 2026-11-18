@@ -307,6 +307,7 @@ def log_paths(log_dir: str | None, name: str, kind: str) -> tuple[Path, Path]:
 # ------------------------------------------------------------------- commands
 
 def cmd_power(args, name, bench) -> int:
+    check_interval(args.off_seconds, "--off-seconds")
     psu = make_power(bench)
     if args.action == "status":
         print(json.dumps(psu.status()))
@@ -315,7 +316,7 @@ def cmd_power(args, name, bench) -> int:
         return power_watch(args, psu)
     with bench_lock(name, f"power {args.action}"):
         if args.action == "cycle":
-            off = args.off_seconds or float(bench["power"].get("off_seconds", 5))
+            off = args.off_seconds if args.off_seconds is not None else float(bench["power"].get("off_seconds", 5))
             power_cycle(psu, off)
             print(json.dumps({"relay": "ON", "cycled_off_seconds": off}))
         else:
@@ -425,7 +426,8 @@ def stage_config(bench: dict, timeout: float | None):
     boot = bench.get("boot") or {}
     stages = boot.get("stages") or DEFAULT_STAGES
     compiled = [(s["name"], re.compile(s["pattern"], re.M), bool(s.get("optional"))) for s in stages]
-    fails = [re.compile(p) for p in boot.get("fail_patterns", DEFAULT_FAIL)]
+    # re.M for both lists, so ^ and $ mean line start/end everywhere.
+    fails = [re.compile(p, re.M) for p in boot.get("fail_patterns", DEFAULT_FAIL)]
     return compiled, fails, timeout or float(boot.get("timeout", 180))
 
 
@@ -757,6 +759,13 @@ def cmd_uboot(args, name, bench) -> int:
         result["error"] = str(e)
         if "interrupt" in result:
             result["error"] += " -- board left at the U-Boot prompt (hil power cycle to recover)"
+    except BenchError as e:
+        # Bench/infra failure (plug, port): still leave a record of the run.
+        result |= {"error": str(e), "result": "ERROR"}
+        if not log_path.exists():
+            result["log"] = None
+        json_path.write_text(json.dumps(result, indent=2) + "\n")
+        raise
 
     result["result"] = "PASS" if ok else "FAIL"
     json_path.write_text(json.dumps(result, indent=2) + "\n")
@@ -824,7 +833,8 @@ def cmd_benches(args, cfg) -> int:
     default = cfg.get("default_bench")
     for n, b in cfg.get("benches", {}).items():
         mark = "*" if n == default else " "
-        print(f"{mark} {n:12} {b.get('description', '')}  [{serial_path(b)}]")
+        port = (b.get("serial") or {}).get("port") or "no serial"
+        print(f"{mark} {n:12} {b.get('description', '')}  [{port}]")
     return 0
 
 

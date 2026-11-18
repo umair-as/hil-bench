@@ -131,5 +131,19 @@ class ThenBootStageTests(UbootHelpers):
         self.assertIn("spl", js["missed"])
 
 
+class UbootBenchErrorTests(UbootHelpers):
+    def test_bench_error_still_writes_json(self):
+        plug = FakePlug()
+        plug.unreachable = True
+        self.setup_board(FakeUboot(), plug)
+        with self.assertRaises(hil.BenchError):
+            self.uboot(self.bench(), action="env")
+        js = sorted((self.tmp / "logs").glob("t-uboot-*.json"))
+        self.assertEqual(len(js), 1)
+        data = json.loads(js[0].read_text())
+        self.assertEqual(data["result"], "ERROR")
+        self.assertIn("unreachable", data["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

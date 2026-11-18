@@ -91,6 +91,32 @@ class ProxyTests(HilTestCase):
         self.assertIn("http", default[0])
 
 
+class SmallFixTests(HilTestCase):
+    def test_off_seconds_validated(self):
+        plug = self.use_fakes(None, FakePlug())
+        for bad in (-1.0, 0.0, float("nan"), float("inf")):
+            with self.assertRaisesRegex(hil.BenchError, "--off-seconds"):
+                hil.cmd_power(ns(action="cycle", off_seconds=bad), "t", self.bench())
+        self.assertEqual(plug.calls, [])
+
+    def test_off_seconds_explicit_value_used(self):
+        self.use_fakes(None, FakePlug())
+        rc = hil.cmd_power(ns(action="cycle", off_seconds=0.02), "t", self.bench())
+        self.assertEqual(rc, 0)
+        self.assertIn('"cycled_off_seconds": 0.02', hil.sys.stdout.getvalue())
+
+    def test_benches_lists_bench_without_serial(self):
+        self.write_config(MainTests.CONFIG + "[benches.noserial]\ndescription = \"power only\"\n")
+        rc, out, err = self.run_main("benches")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("noserial", out)
+        self.assertIn("no serial", out)
+
+    def test_fail_patterns_are_multiline_like_stages(self):
+        _, fails, _ = hil.stage_config({"boot": {"fail_patterns": ["^resetting"]}}, 1)
+        self.assertTrue(fails[0].search("U-Boot\nresetting ...\n"))
+
+
 class LockTests(HilTestCase):
     def test_second_holder_is_refused_with_holder_info(self):
         with hil.bench_lock("t", "power cycle"):
