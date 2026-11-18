@@ -907,6 +907,10 @@ def agent_command_refusal(cmd: str, allow: list[str]) -> str | None:
     """Why an agent may not run cmd at the U-Boot prompt, or None if it may.
     The command must be plain words, match a bench `[uboot] allow` glob, and
     not be destructive (the denylist stays as a second check)."""
+    if not re.fullmatch(r"[\x20-\x7e]*", cmd):
+        # Backspace, Ctrl-U, Ctrl-C, tab, escape sequences would edit the line
+        # at the prompt after the allowlist had matched it.
+        return f"{cmd!r} contains characters that aren't printable ASCII"
     if SHELL_SYNTAX_RX.search(cmd):
         return f"{cmd!r} uses shell syntax (; & | $ quotes \\ ` # {{}} <>)"
     words = " ".join(cmd.split())
@@ -1302,6 +1306,14 @@ class McpServer:
     def __init__(self, path, cfg: dict, mode: int = 0o600):
         self.path, self.cfg, self.mode = Path(path), cfg, mode
         self.sock: socket.socket | None = None
+        self.stopping = threading.Event()
+
+    def request_stop(self) -> None:
+        """Finish the current call (if any), answer it, then stop serving."""
+        self.stopping.set()
+
+    def _stop(self, stop: threading.Event | None) -> bool:
+        return self.stopping.is_set() or bool(stop and stop.is_set())
 
     def bind(self) -> None:
         if os.path.lexists(self.path):
@@ -1340,7 +1352,7 @@ class McpServer:
     def serve(self, stop: threading.Event | None = None) -> None:
         """One client at a time; tool calls run one after the other."""
         try:
-            while not (stop and stop.is_set()):
+            while not self._stop(stop):
                 try:
                     conn, _ = self.sock.accept()
                 except TimeoutError:
@@ -1354,7 +1366,7 @@ class McpServer:
     def handle(self, conn: socket.socket, stop: threading.Event | None) -> None:
         f = conn.makefile("rwb")
         try:
-            while not (stop and stop.is_set()):
+            while not self._stop(stop):
                 line = f.readline(1 << 20)
                 if not line:
                     return
@@ -1445,8 +1457,12 @@ def cmd_mcp(args, cfg: dict) -> int:
     server.bind()
 
     def on_term(*_):
-        raise KeyboardInterrupt  # stop like Ctrl-C, so the socket is removed
+        # Stop like Ctrl-C: an interrupted call still runs its cleanup (relay
+        # back on), its reply is sent, and the socket is removed.
+        server.request_stop()
+        raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
     print(f"hil: MCP server on {server.path} (agent policy for every call)", file=sys.stderr)
     try:
         server.serve()

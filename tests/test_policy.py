@@ -82,6 +82,14 @@ class AllowlistTests(unittest.TestCase):
                   "printenv \\\\", "setenv BOOT_ORDER `x`", "printenv # c", "setenv BOOT_ORDER ${a}"):
             self.assertIn("shell syntax", self.check(c), c)
 
+    def test_control_and_non_ascii_characters_refused(self):
+        # Line-editing keys would change the command at the prompt after the
+        # allowlist matched (backspace, Ctrl-U, Ctrl-C, tab, DEL).
+        for c in ("printenv\bx", "printenv\x15mmc erase 0 1", "printenv\x03", "printenv\tx",
+                  "printenv\x7f", "printenv \u00e9", "printenv\x1b[D"):
+            self.assertIsNotNone(self.check(c), repr(c))
+            self.assertIn("printable", self.check(c), repr(c))
+
     def test_denylist_still_applies(self):
         self.assertIn("destructive", hil.agent_command_refusal("saveenv", ["saveenv"]))
         self.assertIn("destructive", hil.agent_command_refusal("run x", ["run *"]))

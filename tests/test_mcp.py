@@ -137,6 +137,25 @@ class McpTests(HilTestCase):
         self.assertFalse(res["isError"], res)
         self.assertEqual(json.loads(res["content"][0]["text"])["env_before"]["BOOT_ORDER"], "A B")
 
+    def test_backspace_in_command_refused_via_mcp(self):
+        res = self.call("uboot", action="run", commands=["printenv x\u0008\u0008saveenv"])
+        self.assertTrue(res["isError"])
+        self.assertIn("printable", res["content"][0]["text"])
+
+    def test_stop_request_during_a_call_ends_the_server(self):
+        from unittest import mock
+        real = hil.dispatch
+
+        def stopping_dispatch(*a, **kw):
+            self.server.request_stop()  # what SIGTERM does mid-call
+            return real(*a, **kw)
+        with mock.patch.object(hil, "dispatch", stopping_dispatch):
+            res = self.call("power_status")
+        self.assertFalse(res["isError"])
+        self.thread.join(3)
+        self.assertFalse(self.thread.is_alive())
+        self.assertFalse(self.sock_path.exists())
+
     def test_parse_error_and_unknown_method(self):
         self.f.write(b"{not json\n")
         self.f.flush()
