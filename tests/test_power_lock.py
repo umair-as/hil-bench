@@ -6,7 +6,7 @@ import socket
 import unittest
 import urllib.request
 
-from harness import TEST_CONFIG, FakePlug, HilTestCase, hil, ns
+from harness import TEST_CONFIG, FakePlug, HarnessViolation, HilTestCase, hil, ns
 
 
 class PowerTests(HilTestCase):
@@ -133,13 +133,18 @@ class LockTests(HilTestCase):
 
 class GuardTests(HilTestCase):
     def test_network_is_blocked_in_tests(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(HarnessViolation):
             socket.create_connection(("192.0.2.1", 80), timeout=0.1)
 
     def test_tasmota_cmd_never_reaches_network(self):
         t = hil.Tasmota({"host": "192.0.2.1"})
-        with self.assertRaises((AssertionError, hil.BenchError)):
+        with self.assertRaises(HarnessViolation):
             t.cmd("Power1")
+
+    def test_guard_is_not_swallowed_by_the_cli_catch_all(self):
+        self.write_config(TEST_CONFIG)
+        with self.assertRaises(HarnessViolation):
+            self.run_main("power", "status")  # real Tasmota -> guarded network
 
 
 class MainTests(HilTestCase):

@@ -75,6 +75,21 @@ class ExitCodeTests(HilTestCase):
         self.assertEqual(len(js), 1)
         self.assertEqual(json.loads(js[0].read_text())["result"], "ERROR")
 
+    def test_adapter_gone_before_the_cycle(self):
+        ser = FakeSerial()
+
+        def gone():
+            raise OSError(19, "No such device")
+        ser.reset_input_buffer = gone
+        self.use_fakes(ser, self.plug)
+        self.write_config(TEST_CONFIG)
+        log_dir = self.tmp / "logs"
+        for extra in ((), ("--no-cycle",)):
+            with self.subTest(extra=extra):
+                self.assert_rc2("boot", "--timeout", "1", "--log-dir", str(log_dir), *extra, says="serial")
+        self.assertTrue(all(json.loads(p.read_text())["result"] == "ERROR" for p in log_dir.glob("*.json")))
+        self.assertEqual(self.plug.state, "ON")  # the cycle's finally still closed the relay
+
     def test_serial_drop_keeps_stages_reached_before_it(self):
         ser = FakeSerial()
         reads = {"n": 0}
@@ -145,6 +160,24 @@ class ConfigValueTests(HilTestCase):
     def test_non_numeric_baud(self):
         self.write_config(TEST_CONFIG.replace('port = "/dev/null-test"', 'port = "/dev/null-test"\nbaud = "fast"'))
         self.assert_rc2("boot", says="baud")
+
+    def test_out_of_range_config_values(self):
+        cases = [
+            (TEST_CONFIG + "[benches.t.boot]\ntimeout = 0\n", ("boot",), "timeout"),
+            (TEST_CONFIG + "[benches.t.boot]\ntimeout = nan\n", ("boot",), "timeout"),
+            (TEST_CONFIG + "[benches.t.boot]\ntimeout = -3\n", ("boot",), "timeout"),
+            (TEST_CONFIG + "[benches.t.ssh]\nhost = \"192.0.2.5\"\ntimeout = 0\n", ("wait-ssh",), "timeout"),
+            (TEST_CONFIG + "[benches.t.ssh]\nhost = \"192.0.2.5\"\nport = \"x\"\n", ("wait-ssh",), "port"),
+            (TEST_CONFIG + "[benches.t.ssh]\nhost = \"192.0.2.5\"\nport = 70000\n", ("wait-ssh",), "port"),
+            (TEST_CONFIG.replace("off_seconds = 0.01", "off_seconds = -1"), ("power", "cycle"), "off_seconds"),
+            (TEST_CONFIG.replace("off_seconds = 0.01", "off_seconds = inf"), ("power", "cycle"), "off_seconds"),
+            (TEST_CONFIG.replace('host = "192.0.2.1"', 'host = "192.0.2.1"\nrelay = 0'), ("power", "status"), "relay"),
+            (TEST_CONFIG.replace('port = "/dev/null-test"', 'port = "/dev/null-test"\nbaud = 0'), ("boot",), "baud"),
+        ]
+        for text, argv, says in cases:
+            with self.subTest(argv=argv, says=says, cfg=text.splitlines()[-1]):
+                self.write_config(text)
+                self.assert_rc2(*argv, says=says)
 
     def test_bench_without_power_table(self):
         self.write_config('default_bench = "t"\n[benches.t]\n[benches.t.serial]\nport = "/dev/null-test"\n')

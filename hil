@@ -120,11 +120,16 @@ def load_config() -> dict:
         raise BenchError(f"{CONFIG}: {e}") from None
 
 
-def conf_number(table: dict, key: str, default, where: str, kind: type = float):
-    """A number from a config table, or BenchError naming the key (exit 2)."""
+def conf_number(table: dict, key: str, default, where: str, kind: type = float,
+                low: float | None = 0, high: float | None = None):
+    """A number from a config table, or BenchError naming the key (exit 2).
+    It must be finite and > low (default: positive) and <= high if given."""
     val = table.get(key, default)
     if isinstance(val, bool) or not isinstance(val, (int, float)) or (kind is int and not isinstance(val, int)):
         raise BenchError(f"{where} {key} must be {'an integer' if kind is int else 'a number'}, got {val!r}")
+    if not math.isfinite(val) or (low is not None and val <= low) or (high is not None and val > high):
+        bounds = f"> {low}" + (f" and <= {high}" if high is not None else "")
+        raise BenchError(f"{where} {key} must be {bounds}, got {val!r}")
     return kind(val)
 
 
@@ -352,7 +357,7 @@ class Tasmota:
         self.host = conf.get("host")
         if not isinstance(self.host, str) or not self.host:
             raise BenchError("[power] host is missing")
-        self.relay = conf_number(conf, "relay", 1, "[power]", int)
+        self.relay = conf_number(conf, "relay", 1, "[power]", int, high=32)
         # Both off by default; see README "Plug-side safety".
         self.plug_cycle = conf.get("cycle_on_plug", False)
         if not isinstance(self.plug_cycle, bool):
@@ -925,13 +930,21 @@ def print_stages(result: dict) -> None:
         print(f"  FAIL pattern: {result['fail_match']!r}")
 
 
+def flush_input(ser) -> None:
+    """Drop bytes the UART already holds; a gone adapter is a bench error."""
+    try:
+        ser.reset_input_buffer()
+    except OSError as e:
+        raise BenchError(f"serial flush failed: {e}") from None
+
+
 def start_console(args, name, bench, ser, log) -> Console:
     if args.no_cycle:
-        ser.reset_input_buffer()
+        flush_input(ser)
         return Console(ser, log, time.monotonic())
     off = conf_number(bench.get("power") or {}, "off_seconds", 5, "[power]")
     # Clear while the relay is open, so the previous run's tail can't leak in.
-    return Console(ser, log, power_cycle(make_power(bench), off, ser.reset_input_buffer))
+    return Console(ser, log, power_cycle(make_power(bench), off, lambda: flush_input(ser)))
 
 
 def boot_once(args, name, bench, ser, check: StageConfig, kind: str) -> dict:
@@ -1305,7 +1318,7 @@ def cmd_wait_ssh(args, name, bench) -> int:
     host = args.host or os.environ.get("HIL_TARGET") or ssh.get("host")
     if not host:
         raise BenchError("no ssh host (--host, HIL_TARGET, or ssh.host)")
-    port = int(ssh.get("port", 22))
+    port = conf_number(ssh, "port", 22, "[ssh]", int, high=65535)
     check_interval(args.timeout, "--timeout")
     timeout = args.timeout if args.timeout is not None else conf_number(ssh, "timeout", 120, "[ssh]")
     deadline = time.monotonic() + timeout
@@ -1760,9 +1773,16 @@ def dispatch(args, argv: list[str], cfg: dict | None = None, caller: str | None 
         return e.exit_code
     except KeyboardInterrupt:
         return 130
-    except Exception:  # a bug in hil, never a target failure: exit 2, not 1
-        traceback.print_exc()
-        print("hil: internal error (a bug in hil, not a target failure)", file=sys.stderr)
+    except Exception as e:  # a bug in hil, never a target failure: exit 2, not 1
+        if getattr(args, "via", None) == "mcp":
+            # The details go to the server's own stderr, not to the client.
+            traceback.print_exc(file=sys.__stderr__)
+            print("hil: internal error (a bug in hil, not a target failure; details in the server log)",
+                  file=sys.stderr)
+        else:
+            traceback.print_exc()
+            print(f"hil: internal error: {type(e).__name__} (a bug in hil, not a target failure)",
+                  file=sys.stderr)
         return 2
 
 

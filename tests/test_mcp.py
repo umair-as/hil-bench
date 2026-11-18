@@ -169,6 +169,21 @@ class McpTests(HilTestCase):
         self.assertNotIn("boom", res["error"]["message"])  # no internals to the client
         self.assertEqual(self.rpc("ping")["result"], {})
 
+    def test_handler_bug_reaches_client_without_internals(self):
+        import io
+        from unittest import mock
+        server_err = io.StringIO()
+        with mock.patch.object(hil, "cmd_power", side_effect=RuntimeError("secret /srv/path detail")), \
+                mock.patch("sys.__stderr__", server_err):
+            res = self.call("power", bench="t", action="on")
+        self.assertTrue(res["isError"])
+        text = res["content"][0]["text"]
+        self.assertIn("internal error", text)
+        for leak in ("Traceback", "File \"", "/srv/path", "secret"):
+            self.assertNotIn(leak, text)
+        self.assertIn("Traceback", server_err.getvalue())  # the operator still sees it
+        self.assertIn("secret /srv/path detail", server_err.getvalue())
+
     def test_parse_error_and_unknown_method(self):
         self.f.write(b"{not json\n")
         self.f.flush()

@@ -48,6 +48,11 @@ hil = load_hil()
 
 # ---------------------------------------------------------------- guards
 
+class HarnessViolation(BaseException):
+    """A test reached real hardware, network or exec. A BaseException, so
+    hil's catch-all (`except Exception` -> exit 2) can't swallow it."""
+
+
 _real_connect = socket.socket.connect
 
 
@@ -55,15 +60,15 @@ def _guarded_connect(self, address):
     if self.family == socket.AF_UNIX:
         return _real_connect(self, address)
     self.close()
-    raise AssertionError(f"test tried to open a network connection to {address!r}")
+    raise HarnessViolation(f"test tried to open a network connection to {address!r}")
 
 
 def _no_serial(*a, **kw):
-    raise AssertionError("test tried to open a real serial port")
+    raise HarnessViolation("test tried to open a real serial port")
 
 
 def _no_exec(*a, **kw):
-    raise AssertionError(f"test tried to replace the process (exec {a[:1]})")
+    raise HarnessViolation(f"test tried to replace the process (exec {a[:1]})")
 
 
 # ----------------------------------------------------------------- fakes
