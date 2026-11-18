@@ -37,6 +37,10 @@ template. IPs, serial IDs and credential paths stay out of the repo.
 
 - **Config → bench:** `load_config` + `get_bench` select a bench from
   `-b`, `HIL_BENCH`, or `default_bench`. Every `cmd_*` takes `(args, name, bench)`.
+  `apply_paths` takes `STATE`, `LOCK_DIR`, `LOG_DIR` and a default
+  `CREDS_FILE` from the config's `[paths]` (service-user setup,
+  `docs/service-user.md`). Use `lock_path()` / `default_log_dir()`, not
+  `STATE` directly.
 - **Power:** `make_power` dispatches on `power.type`. Only `Tasmota` exists:
   it uses the HTTP `/cm` API with credentials from `creds_file` or
   `TASMOTA_USER`/`TASMOTA_PASS`. They go through urllib and never into argv.
@@ -45,7 +49,9 @@ template. IPs, serial IDs and credential paths stay out of the repo.
   `~/.local/state/hil-bench/<bench>.lock` and writes the holder into it.
   The file stays after a run and isn't proof that the bench is busy; the
   flock is. `open_serial` refuses if any process has the tty open
-  (`port_holders` scans `/proc`), because a tty has no fan-out. Close MCP
+  (`port_busy`: `port_holders` scans `/proc/<pid>/fd`, `flock_holders` reads
+  `/proc/locks` for other users' flocks, and `EBUSY` means `TIOCEXCL`),
+  because a tty has no fan-out. Close MCP
   serial sessions and `tio` first. `hil hold -- CMD` runs another tool under
   the lock and hands it down as `HIL_LOCK_FD`; `inherited_lock` accepts that
   fd only if a non-blocking `flock` on it succeeds, and nested use neither

@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import fnmatch
 import http.client
@@ -49,6 +50,12 @@ from pathlib import Path
 
 CONFIG = Path(os.environ.get("HIL_BENCH_CONFIG", "~/.config/hil-bench/benches.toml")).expanduser()
 STATE = Path(os.environ.get("XDG_STATE_HOME", "~/.local/state")).expanduser() / "hil-bench"
+# Overridden by the config's [paths] table (apply_paths), e.g. to share one
+# state/lock/log location owned by a service user.
+LOCK_DIR: Path | None = None    # default: STATE
+LOG_DIR: Path | None = None     # default: STATE / "logs"
+CREDS_FILE: str | None = None   # default plug creds_file for benches without one
+PATH_KEYS = ("state_dir", "lock_dir", "log_dir", "creds_file")
 
 # Board-agnostic defaults: anything Linux prints whatever boots it.
 # Bootloader stages (EEPROM, U-Boot, UEFI) and image checks (FIT signatures)
@@ -75,6 +82,33 @@ def load_config() -> dict:
         raise BenchError(f"no bench config at {CONFIG} (copy examples/benches.toml.example)")
     with CONFIG.open("rb") as f:
         return tomllib.load(f)
+
+
+def apply_paths(cfg: dict) -> None:
+    """Take state, lock, log and default creds locations from [paths]."""
+    global STATE, LOCK_DIR, LOG_DIR, CREDS_FILE
+    paths = cfg.get("paths") or {}
+    unknown = set(paths) - set(PATH_KEYS)
+    if unknown:
+        raise BenchError(f"unknown [paths] key(s): {', '.join(sorted(unknown))} (have: {', '.join(PATH_KEYS)})")
+    resolved = {}
+    for key, val in paths.items():
+        p = Path(str(val)).expanduser()
+        if not p.is_absolute():
+            raise BenchError(f"[paths] {key} must be an absolute path, got {val!r}")
+        resolved[key] = p
+    if "state_dir" in resolved:
+        STATE = resolved["state_dir"]
+    if "lock_dir" in resolved:
+        LOCK_DIR = resolved["lock_dir"]
+    if "log_dir" in resolved:
+        LOG_DIR = resolved["log_dir"]
+    if "creds_file" in resolved:
+        CREDS_FILE = str(resolved["creds_file"])
+
+
+def default_log_dir() -> Path:
+    return LOG_DIR or STATE / "logs"
 
 
 def get_bench(cfg: dict, name: str | None) -> tuple[str, dict]:
@@ -113,7 +147,7 @@ def flock_holders(path: Path | str, proc_locks: str | None = None) -> list[int]:
 
 
 def lock_path(name: str) -> Path:
-    return STATE / f"{name}.lock"
+    return (LOCK_DIR or STATE) / f"{name}.lock"
 
 
 def inherited_lock(path: Path) -> int | None:
@@ -155,8 +189,8 @@ def bench_lock(name: str, what: str):
     """Exclusive per-bench lock so two projects never cycle the same board.
     Yields the lock's fd. Inside `hil hold`, the inherited lock is reused:
     nothing is rewritten and nothing is released on exit."""
-    STATE.mkdir(parents=True, exist_ok=True)
     path = lock_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
     nested = inherited_lock(path)
     if nested is not None:
         yield nested
@@ -255,7 +289,7 @@ class Tasmota:
     @staticmethod
     def _creds(conf: dict) -> tuple[str, str]:
         env = {}
-        creds = conf.get("creds_file")
+        creds = conf.get("creds_file") or CREDS_FILE
         if creds:
             p = Path(creds).expanduser()
             if not p.exists():
@@ -413,6 +447,17 @@ def port_holders(port: str) -> list[str]:
     return holders
 
 
+def port_busy(port: str) -> list[str]:
+    """Who else has the tty: processes we can inspect (/proc/<pid>/fd, same
+    user), plus flock(2) holders from /proc/locks, which is world-readable
+    and so also shows other users' tio or pyserial sessions."""
+    holders = port_holders(port)
+    for pid in flock_holders(os.path.realpath(port)):
+        if not any(h.endswith(f"[{pid}]") for h in holders):
+            holders.append(f"pid {pid} (flock on the tty, possibly another user)")
+    return holders
+
+
 def open_serial(bench: dict):
     try:
         import serial  # pyserial
@@ -421,7 +466,7 @@ def open_serial(bench: dict):
     port = serial_path(bench)
     if not os.path.exists(port):
         raise BenchError(f"serial port {port} not present")
-    holders = port_holders(port)
+    holders = port_busy(port)
     if holders:
         raise BenchError(f"{port} already open by {', '.join(holders)}; close it first "
                          "(serial_close for the MCP server, quit tio)")
@@ -429,11 +474,16 @@ def open_serial(bench: dict):
     try:
         return serial.Serial(port, baud, timeout=0.2, exclusive=True)
     except serial.SerialException as e:
+        if e.errno == errno.EBUSY:
+            raise BenchError(f"{port} is held exclusively (TIOCEXCL) by another process, "
+                             "possibly another user's; close it first") from None
+        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+            raise BenchError(f"{port} is locked (flock) by another process; close it first") from None
         raise BenchError(f"cannot open {port}: {e}") from None
 
 
 def log_paths(log_dir: str | None, name: str, kind: str) -> tuple[Path, Path]:
-    d = Path(log_dir).expanduser() if log_dir else STATE / "logs"
+    d = Path(log_dir).expanduser() if log_dir else default_log_dir()
     d.mkdir(parents=True, exist_ok=True)
     stem = f"{name}-{kind}-{dt.datetime.now():%Y%m%d-%H%M%S}"
     return d / f"{stem}.log", d / f"{stem}.json"
@@ -1011,10 +1061,10 @@ def cmd_console(args, name, bench) -> int:
     if not tio:
         raise BenchError("tio not installed")
     port = serial_path(bench)
-    holders = port_holders(port)
+    holders = port_busy(port)
     if holders:
         raise BenchError(f"{port} already open by {', '.join(holders)}")
-    log_dir = Path(args.log_dir).expanduser() if args.log_dir else STATE / "logs"
+    log_dir = Path(args.log_dir).expanduser() if args.log_dir else default_log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     baud = str(bench["serial"].get("baud", 115200))
     os.execv(tio, [tio, "-b", baud, "--log", "--log-directory", str(log_dir), port])
@@ -1128,6 +1178,7 @@ def main() -> int:
     args = ap.parse_args()
     try:
         cfg = load_config()
+        apply_paths(cfg)
         if args.cmd == "benches":
             return cmd_benches(args, cfg)
         name, bench = get_bench(cfg, args.bench)

@@ -177,7 +177,10 @@ For an agent caller:
 
 On its own this is a promise, not enforcement: an agent running as the same
 user can edit the config or call the plug directly. Run `hil` as a separate
-service user (below) to make it binding.
+service user to make it binding; see
+[`docs/service-user.md`](docs/service-user.md). A `[paths]` table in
+`benches.toml` (`state_dir`, `lock_dir`, `log_dir`, default `creds_file`)
+moves state, locks, logs and credentials to a shared location for that.
 
 ## Sharing the bench
 
@@ -187,8 +190,10 @@ service user (below) to make it binding.
   protocol (path, `flock(2)`, holder line) is in
   [`docs/bench-lock.md`](docs/bench-lock.md).
 - **One reader on the UART.** A tty has no fan-out, so two readers each get
-  part of the bytes. `hil boot` and `hil console` refuse if anything already
-  has the port open (and name the process). Before running, close any MCP
+  part of the bytes. `hil boot`, `hil uboot` and `hil console` refuse if
+  anything already has the port open (and name the process). That includes
+  another user's `tio` or pyserial session (found through `/proc/locks`) and
+  a tty held in `TIOCEXCL` mode. Before running, close any MCP
   serial session (`serial_close`) and quit `tio`.
 - **Other tools under the lock.** The lock only covers `hil`'s own
   commands. Wrap anything that must not lose power halfway, such as a

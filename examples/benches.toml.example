@@ -2,6 +2,15 @@
 # Host-local: IPs, serial IDs and credential paths never go in a project repo.
 
 default_bench = "rpi5"
+
+# Optional shared locations, e.g. when hil runs as a service user
+# (docs/service-user.md). Absolute paths only. Keep this table below the
+# top-level keys: in TOML, keys after a [table] header belong to it.
+# [paths]
+# state_dir = "/var/lib/hil-bench"          # actions.jsonl
+# lock_dir = "/var/lib/hil-bench/locks"     # <bench>.lock (default: state_dir)
+# log_dir = "/var/log/hil-bench"            # default --log-dir
+# creds_file = "/etc/hil-bench/tasmota.creds"   # for benches without their own
 # caller = "agent"   # every caller is an agent (see README "Caller policy");
 #                    # HIL_CALLER=agent in an agent's environment does the same
 
