@@ -97,6 +97,14 @@ template. IPs, serial IDs and credential paths stay out of the repo.
 - **Outputs:** `boot` and `uboot` write `<bench>-<kind>-<ts>.log` (raw) plus a
   `.json` summary to `--log-dir` or `~/.local/state/hil-bench/logs/`.
   Grep the raw logs with `grep -a`.
+- **Entry points:** `build_parser()` + `dispatch(args, argv, cfg, caller)`;
+  `main()` is `dispatch(build_parser().parse_args(argv), argv)`.
+- **MCP:** `hil mcp` (`McpServer`) maps each tool in `MCP_TOOLS` to a fixed
+  argv (`mcp_argv`, values as `--opt=VALUE`) and runs it through
+  `dispatch(..., cfg=<loaded at start>, caller="agent")` with stdout and
+  stderr captured. Adding a tool means adding a schema, an argv mapping and
+  a test. Never expose `console`, `hold`, `uboot shell` or
+  `--allow-destructive`.
 - **Exit codes:** `0` pass, `1` target failed a check (`UbootError` too),
   `2` bench/config/infra error (`BenchError`), `3` bench locked (`BenchLocked`).
 

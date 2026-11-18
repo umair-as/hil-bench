@@ -37,6 +37,7 @@ carries the credentials in the URL query string.
 | `hil wait-ssh [--host H] [--timeout S]` | wait for the sshd banner |
 | `hil console [--log-dir D]` | interactive `tio` with logging |
 | `hil lock` | who holds the bench lock, as JSON (read-only, never takes the lock) |
+| `hil mcp --socket PATH [--socket-mode 600\|660]` | serve a small MCP tool set on a Unix socket, every call with the agent policy (see below) |
 | `hil hold -- CMD [ARGS…]` | run CMD (flasher, installer, test script) under the bench lock; exits with CMD's code |
 
 Select a bench with `-b NAME`, `HIL_BENCH`, or `default_bench`.
@@ -181,6 +182,42 @@ service user to make it binding; see
 [`docs/service-user.md`](docs/service-user.md). A `[paths]` table in
 `benches.toml` (`state_dir`, `lock_dir`, `log_dir`, default `creds_file`)
 moves state, locks, logs and credentials to a shared location for that.
+
+## MCP server (`hil mcp`)
+
+`hil mcp --socket PATH` serves the Model Context Protocol (JSON-RPC 2.0, one
+message per line, as on stdio) on a Unix socket, so an agent can drive the
+bench without a shell. The operator starts it, ideally as the service user.
+It has a small, fixed tool set:
+
+| Tool | Arguments | Same as |
+|---|---|---|
+| `benches` | | `hil benches` |
+| `lock_status` | `bench` | `hil lock` |
+| `power_status` | `bench` | `hil power status` |
+| `power` | `bench`, `action`: `on`/`off`/`cycle` | `hil power …` |
+| `boot` | `bench`, `timeout`, `no_cycle` | `hil boot --json` |
+| `uboot` | `bench`, `action`: `env`/`slot`/`reset-counters`/`run`, `slot`, `commands`, `then`: `boot`/`stay`/`reset` | `hil uboot … --json` |
+
+- Every call runs through the same code as the CLI, with the **agent**
+  caller policy forced, whatever the config or environment says. The
+  config is read once, at start. Calls take the bench lock, go into the
+  action log with `"via": "mcp"`, and `uboot run` only accepts the bench's
+  allowlist.
+- There is no tool for `console`, `uboot shell`, `hold` or
+  `--allow-destructive`, and unknown arguments are rejected.
+- The socket is created `0600` (`--socket-mode 660` lets the owner's group
+  connect). Who may connect is decided by those permissions. Calls run one
+  at a time; a running `boot` blocks the next call.
+- SIGTERM or Ctrl-C stops the server and removes the socket. A stale
+  socket from a crash is replaced on the next start.
+
+A client that only speaks stdio connects through `socat`, e.g. in an MCP
+client config:
+
+```json
+{"mcpServers": {"hil": {"command": "socat", "args": ["STDIO", "UNIX-CONNECT:/run/hil-bench/mcp.sock"]}}}
+```
 
 ## Sharing the bench
 

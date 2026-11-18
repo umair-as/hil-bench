@@ -14,6 +14,7 @@ never in this tool.
     hil console [--log-dir DIR]
     hil hold -- CMD [ARGS...]
     hil lock
+    hil mcp --socket PATH [--socket-mode 600|660]
     hil benches
 
 Exit status: 0 pass, 1 target failed a check, 2 bench/config/infra error,
@@ -29,6 +30,7 @@ import errno
 import fcntl
 import fnmatch
 import http.client
+import io
 import json
 import math
 import os
@@ -36,7 +38,9 @@ import pwd
 import re
 import shlex
 import shutil
+import signal
 import socket
+import stat
 import statistics
 import subprocess
 import sys
@@ -244,10 +248,10 @@ def append_action(record: dict) -> None:
         raise BenchError(f"cannot write the action log {path}: {e}") from None
 
 
-def run_recorded(name: str, args, fn) -> int:
+def run_recorded(name: str, args, fn, argv: list[str]) -> int:
     """Run fn() between a start and an end record. No start record, no action."""
     rec = {"pid": os.getpid(), "user": current_user(), "caller": getattr(args, "caller", None),
-           "bench": name, "argv": sys.argv[1:]}
+           "bench": name, "argv": argv} | ({"via": args.via} if getattr(args, "via", None) else {})
     append_action({"ts": now_iso(), "event": "start"} | rec)
     rc, err = None, None
     try:
@@ -1199,7 +1203,259 @@ def cmd_benches(args, cfg) -> int:
     return 0
 
 
-def main() -> int:
+# ------------------------------------------------------------------- MCP
+
+# A thin MCP server (JSON-RPC 2.0, one message per line, as on stdio) on a
+# Unix socket. Every tool call becomes a fixed hil argv and runs through
+# dispatch() with the agent policy forced and the config loaded at start,
+# so it obeys the same lock, action log, allowlist and denylist as the CLI.
+# There is deliberately no tool for console, hold, wait-ssh or raw U-Boot.
+
+MCP_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+_BENCH = {"type": "string", "pattern": r"^[A-Za-z0-9_.-]{1,64}$",
+          "description": "bench name (default: the configured default_bench)"}
+
+
+def _tool(name: str, description: str, props: dict | None = None, required: list | None = None) -> dict:
+    schema = {"type": "object", "properties": props or {}, "additionalProperties": False}
+    if required:
+        schema["required"] = required
+    return {"name": name, "description": description, "inputSchema": schema}
+
+
+MCP_TOOLS = [
+    _tool("benches", "List the configured benches."),
+    _tool("lock_status", "Who holds a bench's lock (read-only).", {"bench": _BENCH}),
+    _tool("power_status", "Relay state and W/V/A of a bench's plug (read-only).", {"bench": _BENCH}),
+    _tool("power", "Switch a bench's power: on, off or cycle. Takes the bench lock.",
+          {"bench": _BENCH, "action": {"type": "string", "enum": ["on", "off", "cycle"]}}, ["action"]),
+    _tool("boot", "Power-cycle the board (unless no_cycle) and check its boot stages on the UART. "
+          "Returns the JSON summary; isError means the boot failed or the bench refused.",
+          {"bench": _BENCH, "timeout": {"type": "number", "minimum": 1, "maximum": 3600},
+           "no_cycle": {"type": "boolean"}}),
+    _tool("uboot", "Stop autoboot and work at the U-Boot prompt: read the env, select an A/B slot, "
+          "reset boot counters, or run commands from the bench's allowlist. "
+          "Then boot (default), stay at the prompt, or reset.",
+          {"bench": _BENCH, "action": {"type": "string", "enum": ["env", "slot", "reset-counters", "run"]},
+           "slot": {"type": "string", "enum": ["A", "B"]},
+           "commands": {"type": "array", "items": {"type": "string", "maxLength": 200}, "maxItems": 20},
+           "then": {"type": "string", "enum": ["boot", "stay", "reset"]}}, ["action"]),
+]
+
+
+class McpInvalidParams(Exception):
+    pass
+
+
+def mcp_check_args(tool: dict, args) -> None:
+    schema = tool["inputSchema"]
+    if not isinstance(args, dict):
+        raise McpInvalidParams("arguments must be an object")
+    unknown = set(args) - set(schema["properties"])
+    if unknown:
+        raise McpInvalidParams(f"unknown argument(s) for {tool['name']}: {', '.join(sorted(unknown))}")
+    missing = set(schema.get("required", [])) - set(args)
+    if missing:
+        raise McpInvalidParams(f"missing argument(s): {', '.join(sorted(missing))}")
+    for key, val in args.items():
+        spec = schema["properties"][key]
+        kind = spec["type"]
+        ok = {"string": isinstance(val, str),
+              "boolean": isinstance(val, bool),
+              "number": isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val),
+              "array": isinstance(val, list)}[kind]
+        if ok and kind == "string":
+            ok = ("enum" not in spec or val in spec["enum"]) and \
+                 ("pattern" not in spec or re.match(spec["pattern"], val) is not None)
+        if ok and kind == "number":
+            ok = spec.get("minimum", -math.inf) <= val <= spec.get("maximum", math.inf)
+        if ok and kind == "array":
+            ok = len(val) <= spec.get("maxItems", 100) and all(
+                isinstance(v, str) and len(v) <= spec["items"].get("maxLength", 1000) for v in val)
+        if not ok:
+            raise McpInvalidParams(f"invalid value for {key!r}")
+
+
+def mcp_argv(name: str, a: dict) -> list[str]:
+    """Tool arguments -> hil argv. Values go in --opt=VALUE form, so a value
+    starting with '-' can't turn into another option."""
+    argv = [f"--bench={a['bench']}"] if "bench" in a else []
+    if name == "benches":
+        return ["benches"]
+    if name == "lock_status":
+        return argv + ["lock"]
+    if name == "power_status":
+        return argv + ["power", "status"]
+    if name == "power":
+        return argv + ["power", a["action"]]
+    if name == "boot":
+        argv += ["boot", "--json"] + ([f"--timeout={a['timeout']}"] if "timeout" in a else [])
+        return argv + (["--no-cycle"] if a.get("no_cycle") else [])
+    if name == "uboot":
+        argv += ["uboot", a["action"]] + ([a["slot"]] if "slot" in a else [])
+        argv += [f"--cmd={c}" for c in a.get("commands", [])]
+        return argv + [f"--then={a.get('then', 'boot')}", "--json"]
+    raise McpInvalidParams(f"unknown tool {name!r}")
+
+
+class McpServer:
+    def __init__(self, path, cfg: dict, mode: int = 0o600):
+        self.path, self.cfg, self.mode = Path(path), cfg, mode
+        self.sock: socket.socket | None = None
+
+    def bind(self) -> None:
+        if os.path.lexists(self.path):
+            if not stat.S_ISSOCK(os.lstat(self.path).st_mode):
+                raise BenchError(f"{self.path} exists and is not a socket")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(str(self.path))
+            except OSError:
+                os.unlink(self.path)  # stale socket from an earlier run
+            else:
+                raise BenchError(f"{self.path}: a server is already listening")
+            finally:
+                probe.close()
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old = os.umask(0o177)  # never world- or group-accessible, even briefly
+        try:
+            sock.bind(str(self.path))
+        except OSError as e:
+            sock.close()
+            raise BenchError(f"cannot listen on {self.path}: {e}") from None
+        finally:
+            os.umask(old)
+        os.chmod(self.path, self.mode)
+        sock.listen(4)
+        sock.settimeout(0.5)
+        self.sock = sock
+
+    def close(self) -> None:
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.path)
+
+    def serve(self, stop: threading.Event | None = None) -> None:
+        """One client at a time; tool calls run one after the other."""
+        try:
+            while not (stop and stop.is_set()):
+                try:
+                    conn, _ = self.sock.accept()
+                except TimeoutError:
+                    continue
+                with conn:
+                    conn.settimeout(None)
+                    self.handle(conn, stop)
+        finally:
+            self.close()
+
+    def handle(self, conn: socket.socket, stop: threading.Event | None) -> None:
+        f = conn.makefile("rwb")
+        try:
+            while not (stop and stop.is_set()):
+                line = f.readline(1 << 20)
+                if not line:
+                    return
+                if not line.endswith(b"\n"):
+                    resp = self.error(None, -32600, "message too long")
+                    f.write((json.dumps(resp) + "\n").encode())
+                    f.flush()
+                    return
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    resp = self.error(None, -32700, "parse error")
+                else:
+                    resp = self.handle_msg(msg)
+                if resp is not None:
+                    f.write((json.dumps(resp) + "\n").encode())
+                    f.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        finally:
+            with contextlib.suppress(OSError):
+                f.close()
+
+    @staticmethod
+    def error(mid, code: int, message: str) -> dict:
+        return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+    def handle_msg(self, msg) -> dict | None:
+        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+            return self.error(msg.get("id") if isinstance(msg, dict) else None, -32600, "invalid request")
+        mid, method, params = msg.get("id"), msg["method"], msg.get("params") or {}
+        if "id" not in msg:
+            return None  # notification (e.g. notifications/initialized)
+        if method == "initialize":
+            want = params.get("protocolVersion") if isinstance(params, dict) else None
+            version = want if want in MCP_PROTOCOLS else MCP_PROTOCOLS[0]
+            return {"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": version, "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "hil", "version": "1"},
+                "instructions": "Shared HIL bench control. Calls run with the agent caller policy."}}
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": mid, "result": {}}
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": mid, "result": {"tools": MCP_TOOLS}}
+        if method == "tools/call":
+            try:
+                return {"jsonrpc": "2.0", "id": mid, "result": self.call(params)}
+            except McpInvalidParams as e:
+                return self.error(mid, -32602, str(e))
+        return self.error(mid, -32601, f"method not found: {method}")
+
+    def call(self, params) -> dict:
+        if not isinstance(params, dict):
+            raise McpInvalidParams("params must be an object")
+        name = params.get("name")
+        tool = next((t for t in MCP_TOOLS if t["name"] == name), None)
+        if tool is None:
+            raise McpInvalidParams(f"unknown tool {name!r}")
+        args = params.get("arguments") or {}
+        mcp_check_args(tool, args)
+        argv = mcp_argv(name, args)
+        try:
+            parsed = build_parser().parse_args(argv)
+        except SystemExit:
+            raise McpInvalidParams("arguments rejected") from None
+        parsed.via = "mcp"
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = dispatch(parsed, argv, cfg=self.cfg, caller="agent")
+            except Exception as e:  # keep serving; report it to the client
+                rc = 2
+                print(f"hil: internal error: {type(e).__name__}: {e}", file=sys.stderr)
+        text = "\n".join(t for t in (out.getvalue().strip(), err.getvalue().strip()) if t)
+        return {"content": [{"type": "text", "text": text or f"exit {rc}"}], "isError": rc != 0}
+
+
+def cmd_mcp(args, cfg: dict) -> int:
+    try:
+        mode = int(args.socket_mode, 8)
+    except ValueError:
+        raise BenchError("--socket-mode must be octal, e.g. 600 or 660") from None
+    if mode & ~0o660:
+        raise BenchError("--socket-mode may grant owner/group read-write only (at most 660)")
+    server = McpServer(Path(args.socket).expanduser(), cfg, mode)
+    server.bind()
+
+    def on_term(*_):
+        raise KeyboardInterrupt  # stop like Ctrl-C, so the socket is removed
+    signal.signal(signal.SIGTERM, on_term)
+    print(f"hil: MCP server on {server.path} (agent policy for every call)", file=sys.stderr)
+    try:
+        server.serve()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="hil", description=__doc__.split("\n\n")[0])
     ap.add_argument("-b", "--bench", help="bench name (default: HIL_BENCH or default_bench)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1260,18 +1516,31 @@ def main() -> int:
 
     sub.add_parser("benches", help="list configured benches")
 
-    args = ap.parse_args()
+    p = sub.add_parser("mcp", help="serve a small MCP tool set on a Unix socket (agent policy)")
+    p.add_argument("--socket", required=True, help="Unix socket path to listen on")
+    p.add_argument("--socket-mode", default="600", help="octal permissions of the socket (600 or 660)")
+    return ap
+
+
+def dispatch(args, argv: list[str], cfg: dict | None = None, caller: str | None = None) -> int:
+    """Run parsed args. cfg: an already loaded config (else read it now).
+    caller='agent' forces the agent policy; nothing can loosen it."""
     try:
-        cfg = load_config()
-        apply_paths(cfg)
+        if cfg is None:
+            cfg = load_config()
+            apply_paths(cfg)
         if args.cmd == "benches":
             return cmd_benches(args, cfg)
+        if args.cmd == "mcp":
+            if caller == "agent":
+                raise BenchError("mcp can't be started from an MCP call")
+            return cmd_mcp(args, cfg)
         name, bench = get_bench(cfg, args.bench)
-        args.caller = caller_policy(cfg, bench)
+        args.caller = "agent" if caller == "agent" else caller_policy(cfg, bench)
         fn = {"power": cmd_power, "boot": cmd_boot, "uboot": cmd_uboot, "wait-ssh": cmd_wait_ssh,
               "console": cmd_console, "hold": cmd_hold, "lock": cmd_lock}[args.cmd]
         if is_recorded(args):
-            return run_recorded(name, args, lambda: fn(args, name, bench))
+            return run_recorded(name, args, lambda: fn(args, name, bench), argv)
         return fn(args, name, bench)
     except BenchLocked as e:
         print(f"hil: {e}", file=sys.stderr)
@@ -1281,6 +1550,11 @@ def main() -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    return dispatch(build_parser().parse_args(argv), argv)
 
 
 if __name__ == "__main__":
