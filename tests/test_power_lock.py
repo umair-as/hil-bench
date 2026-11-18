@@ -53,6 +53,44 @@ class PowerCycleReplyLostTests(HilTestCase):
         self.assertEqual(plug.calls, ["power Off", "power On"])
 
 
+class ProxyTests(HilTestCase):
+    """Plug credentials ride in the query string; a proxy must never see them."""
+
+    def test_plug_requests_ignore_proxy_environment(self):
+        import os
+        os.environ["http_proxy"] = os.environ["HTTP_PROXY"] = "http://192.0.2.99:3128"
+        seen = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                pass
+
+            def read(self):
+                return b'{"POWER1": "ON"}'
+
+        def fake_open(opener, req, timeout=None):
+            seen["handlers"] = [type(h).__name__ for h in opener.handlers]
+            seen["proxies"] = [getattr(h, "proxies", None) for h in opener.handlers
+                               if isinstance(h, urllib.request.ProxyHandler)]
+            return Resp()
+
+        t = hil.Tasmota({"host": "192.0.2.1"})
+        from unittest import mock
+        with mock.patch.object(urllib.request.OpenerDirector, "open", fake_open), \
+                mock.patch.object(urllib.request, "urlopen", side_effect=AssertionError("global urlopen used")):
+            self.assertEqual(t.power(), "ON")
+        # No handler that would proxy: ProxyHandler({}) has no *_open methods,
+        # so build_opener() doesn't even register it.
+        self.assertFalse(any(seen["proxies"]), seen)
+        # Control: the default opener would have used the proxy from the env.
+        default = [h.proxies for h in urllib.request.build_opener().handlers
+                   if isinstance(h, urllib.request.ProxyHandler)]
+        self.assertIn("http", default[0])
+
+
 class LockTests(HilTestCase):
     def test_second_holder_is_refused_with_holder_info(self):
         with hil.bench_lock("t", "power cycle"):

@@ -18,7 +18,9 @@ ln -s "$PWD/hil" ~/.local/bin/hil                                   # optional
 Plug credentials stay in their own file (`TASMOTA_USER=` / `TASMOTA_PASS=`),
 referenced by `creds_file`. `TASMOTA_USER`/`TASMOTA_PASS` in the environment
 override it. The credentials are passed through urllib, never on a command
-line, so they don't show up in `ps` or in logs.
+line, so they don't show up in `ps` or in logs. Requests to the plug always
+go direct and ignore `http_proxy`/`HTTP_PROXY`, because the plug's `/cm` API
+carries the credentials in the URL query string.
 
 ## Commands
 
