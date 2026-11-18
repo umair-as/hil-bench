@@ -1,19 +1,54 @@
-# hil-bench
+<div align="center">
 
-Shared hardware-in-the-loop bench control: switch a target's power, capture
-its boot console, and assert it reached a login prompt. It is project-agnostic:
-any Yocto tree (or an agent working in one) calls `hil` and doesn't need its
-own copy of the bench details.
+# 🔌 hil-bench
+
+**Shared hardware-in-the-loop bench control for embedded Linux boards**
+
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776ab.svg)](https://www.python.org/)
+[![Single file](https://img.shields.io/badge/CLI-single%20file-informational.svg)](hil)
+[![Power](https://img.shields.io/badge/power-Tasmota%20plug-00a7e1.svg)](https://tasmota.github.io/docs/)
+[![U-Boot](https://img.shields.io/badge/recovery-U--Boot%20%2B%20RAUC-green.svg)](https://rauc.io/)
+[![MCP](https://img.shields.io/badge/agents-MCP%20server-8a2be2.svg)](https://modelcontextprotocol.io/)
+[![Tests](https://img.shields.io/badge/tests-offline%2C%20no%20hardware-success.svg)](tests/)
+
+</div>
+
+---
+
+## 📋 Overview
+
+`hil` switches a target's power, captures its boot console, and checks that it
+reached a login prompt. It is project-agnostic: any Yocto tree, or an agent
+working in one, calls `hil` instead of keeping its own copy of the bench
+details. Board-specific values live in a host-local config, never in the tool.
+
+**Key features:**
+- ⚡ **Power control:** Tasmota smart plug over HTTP; on/off/cycle, with the relay always switched back on if a run is interrupted
+- 🖥️ **Boot checks on the UART:** ordered boot stages, fail patterns, per-stage timing from relay close, PASS/FAIL with logs and JSON
+- 📈 **Measurement:** boot series with min/median/max/stdev, plug power sampling with avg/peak W and Wh
+- 🛠️ **U-Boot recovery:** stop autoboot, read and repair the env, switch RAUC A/B slots, then re-check with a real boot
+- 🔒 **Bench sharing:** per-bench lock (also for other tools), exclusive UART access, an append-only action log
+- 🤖 **Safe for agents:** caller policy with a U-Boot allowlist, wider denylist, and an MCP server with a fixed tool set
+- 🧯 **Plug-side safety (opt-in):** power cycles the plug finishes on its own, and a `PulseTime` dead-man for unattended runs
 
 Requirements: Python ≥ 3.11 (`tomllib`), `pyserial`, and `tio` for `hil console`.
 
-## Setup
+---
+
+## 🚀 Quick start
 
 ```bash
 mkdir -p ~/.config/hil-bench
 cp examples/benches.toml.example ~/.config/hil-bench/benches.toml   # fill in
 ln -s "$PWD/hil" ~/.local/bin/hil                                   # optional
+
+hil benches                  # list benches
+hil -b mybench power status  # read-only
+hil -b mybench boot          # power-cycle and check the boot
 ```
+
+## 🔑 Plug credentials
 
 Plug credentials stay in their own file (`TASMOTA_USER=` / `TASMOTA_PASS=`),
 referenced by `creds_file`. `TASMOTA_USER`/`TASMOTA_PASS` in the environment
@@ -22,7 +57,7 @@ line, so they don't show up in `ps` or in logs. Requests to the plug always
 go direct and ignore `http_proxy`/`HTTP_PROXY`, because the plug's `/cm` API
 carries the credentials in the URL query string.
 
-> **Plug security.** Tasmota's `/cm` API is plain HTTP and takes the
+> ⚠️ **Plug security.** Tasmota's `/cm` API is plain HTTP and takes the
 > credentials as URL query parameters, so anyone who can see the bench
 > network traffic can read them. `hil` can't change that; it's how the plug
 > works. Keep the plugs on an isolated bench network (VLAN) that only the
@@ -31,7 +66,9 @@ carries the credentials in the URL query string.
 > credentials are admin access: they can also change rules, scripts, the
 > OTA URL and `PowerOnState`.
 
-## Commands
+---
+
+## 🧰 Commands
 
 | Command | Does |
 |---|---|
@@ -54,7 +91,7 @@ Select a bench with `-b NAME`, `HIL_BENCH`, or `default_bench`.
 Exit codes: `0` pass, `1` target failed (stage missing, fail pattern,
 ssh down), `2` bench/config/infra error, `3` bench locked by another run.
 
-### Typical gate after flashing or an OTA install
+### ✅ Typical gate after flashing or an OTA install
 
 ```bash
 hil boot --log-dir ./tio-session-logs \
@@ -62,7 +99,9 @@ hil boot --log-dir ./tio-session-logs \
   && ./path/to/project-target-checks.sh "$TARGET"   # the project's own checks
 ```
 
-## Boot stages
+---
+
+## 🥾 Boot stages
 
 `hil boot` matches regexes against the console **in order**, and records the
 time of each match measured from the moment the relay closed. Optional stages
@@ -82,7 +121,7 @@ matching `.json` summary to `--log-dir`, defaulting to
 `~/.local/state/hil-bench/logs/`. Grep raw logs with `grep -a`, because
 consoles emit control bytes.
 
-## Timing and power measurement
+## ⏱️ Timing and power measurement
 
 Each stage line shows the time since relay close and, in brackets, the gap
 from the previous stage, so the slow step in a boot stands out.
@@ -111,7 +150,9 @@ pattern, or timeout). A dropped plug reading is reported in the run's `power`
 result but doesn't fail the boot, and `power watch` skips it, prints it to
 stderr and counts it in its summary.
 
-## U-Boot recovery (`hil uboot`)
+---
+
+## 🛠️ U-Boot recovery (`hil uboot`)
 
 Power-cycles the board (`--no-cycle` to catch a reset you trigger yourself),
 stops the autoboot countdown, and works at the U-Boot shell. This gets a board
@@ -162,7 +203,9 @@ again, required or not. `--then stay` leaves the board at the prompt, and
   different bootloader (e.g. UEFI) only uses `power`, `boot`,
   `wait-ssh` and `console`.
 
-## Caller policy (human or agent)
+---
+
+## 🤖 Caller policy (human or agent)
 
 A caller is either `human` (default) or `agent`. The policy comes from the
 config and the environment the operator sets, never from a command-line
@@ -195,7 +238,7 @@ Under a service user, give agents the MCP socket, not the CLI: run as the
 service user, `hold`, `power watch --csv` and `--log-dir` go beyond what
 the caller policy covers.
 
-## MCP server (`hil mcp`)
+## 🔗 MCP server (`hil mcp`)
 
 `hil mcp --socket PATH` serves the Model Context Protocol (JSON-RPC 2.0, one
 message per line, as on stdio) on a Unix socket, so an agent can drive the
@@ -236,7 +279,9 @@ client config:
 {"mcpServers": {"hil": {"command": "socat", "args": ["STDIO", "UNIX-CONNECT:/run/hil-bench/mcp.sock"]}}}
 ```
 
-## Sharing the bench
+---
+
+## 🔒 Sharing the bench
 
 - **One user at a time.** `power on/off/cycle`, `boot` and `uboot` hold
   `~/.local/state/hil-bench/<bench>.lock`. A second caller gets exit `3` and
@@ -273,14 +318,16 @@ client config:
   themselves with `tio`, so they only get a `start` line. Read-only
   commands (`power status/watch`, `benches`, `wait-ssh`) aren't logged.
 
-## Power-loss behaviour of the plug
+---
+
+## 🔋 Power-loss behaviour of the plug
 
 Tasmota `PowerOnState` decides what the relay does after the plug loses mains.
 `3` (restore the last state) can leave a bench dark if it was off during an
 outage. For an unattended bench, `PowerOnState 1` (always on) is the usual
 choice.
 
-## Plug-side safety (opt-in)
+## 🧯 Plug-side safety (opt-in)
 
 Two Tasmota features make the plug itself finish what the host started.
 Both are off by default. Set them per bench in `[benches.X.power]`:
@@ -308,9 +355,26 @@ Both are off by default. Set them per bench in `[benches.X.power]`:
 
 `PulseTime` is stored on the plug and also applies when someone presses the
 plug's button. Without either setting or flag, `hil` never touches it.
-The plug-side cycle was checked on a Tasmota 14.3 plug. `PulseTime` follows
-the documented encoding but hasn't been checked on a real plug yet.
+Both were checked on a Tasmota 14.3 plug: the plug-side cycle survived
+`hil` being killed mid-cycle, and `--max-on 12` switched the relay off on its
+own after about 12 s.
 
-## License
+---
 
-MIT, see `LICENSE`.
+## 📚 More docs
+
+- [`docs/bench-lock.md`](docs/bench-lock.md): the lock protocol other tools follow
+- [`docs/service-user.md`](docs/service-user.md): running `hil` as a service user, agents via the MCP socket
+- [`docs/nous-a8t.md`](docs/nous-a8t.md): notes on the Tasmota bench plug, calibration, the Backlog/Delay finding
+
+## 🧪 Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The suite runs offline: it fakes the serial port, the plug and a U-Boot shell, and any real network or serial access in a test fails.
+
+## 📄 License
+
+MIT, see [`LICENSE`](LICENSE).
