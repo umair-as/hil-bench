@@ -48,6 +48,26 @@ hil -b mybench power status  # read-only
 hil -b mybench boot          # power-cycle and check the boot
 ```
 
+## 📦 Versions and more than one bench host
+
+Releases are git tags (`v1.0.0`, …) with a matching `__version__` in `hil`.
+On every bench host, run `hil` from a checkout of a tag and link it onto
+PATH:
+
+```bash
+git clone https://github.com/umair-as/hil-bench.git ~/hil-bench
+cd ~/hil-bench && git checkout v1.0.0
+ln -s "$PWD/hil" ~/.local/bin/hil
+hil --version        # hil 1.0.0 (v1.0.0)
+```
+
+`hil --version` adds `git describe` when it runs from a checkout:
+`v1.0.0-2-g1a2b3c4` is 2 commits past the tag, and `-dirty` means local
+edits. Every boot, U-Boot and series `.json` and every action-log line
+carries the same string as `hil_version`, so each result says which `hil`
+produced it, whichever host ran it. To update a host: `git fetch --tags &&
+git checkout vX.Y.Z`.
+
 ## 🔑 Plug credentials
 
 Plug credentials stay in their own file (`TASMOTA_USER=` / `TASMOTA_PASS=`),
@@ -72,6 +92,7 @@ carries the credentials in the URL query string.
 
 | Command | Does |
 |---|---|
+| `hil --version` | release and git state of this copy, e.g. `hil 1.0.0 (v1.0.0-2-g1a2b3c4-dirty)` |
 | `hil benches` | list configured benches (`*` = default) |
 | `hil power status` | relay state + W / V / A / kWh today (no lock taken) |
 | `hil power on\|off\|cycle [--off-seconds N] [--max-on S]` | relay control; `--max-on` arms the plug's own switch-off timer (see "Plug-side safety") |
@@ -231,6 +252,10 @@ For an agent caller:
 - `env`, `slot` and `reset-counters` stay available.
 - Every action log line carries the caller.
 
+**Run AI agents with `HIL_CALLER=agent`** in their environment (or
+`caller = "agent"` in that host's config). Without it, an agent calling the
+CLI gets the human policy, with no allowlist.
+
 On its own this is a promise, not enforcement: an agent running as the same
 user can edit the config or call the plug directly. Run `hil` as a separate
 service user to make it binding; see
@@ -314,8 +339,9 @@ client config:
   so the board isn't left without power.
 - **Action log.** Every state-changing command (`power on/off/cycle`, `boot`,
   `uboot`, `console`, `hold`) appends a `start` and an `end` line to
-  `~/.local/state/hil-bench/actions.jsonl`: time, pid, user, bench, the
-  command line, and on `end` the exit code and any error. Refused runs
+  `~/.local/state/hil-bench/actions.jsonl`: time, pid, user, caller, bench,
+  the command line, `hil_version`, and on `end` the exit code and any
+  error. Refused runs
   (bench locked, plug unreachable) are logged too. If the start line can't
   be written, the command doesn't run. `console` and `uboot shell` replace
   themselves with `tio`, so they only get a `start` line. Read-only

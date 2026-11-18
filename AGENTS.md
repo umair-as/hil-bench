@@ -187,6 +187,19 @@ The main checkout of this repo is usually what `hil` on the bench host runs
   (fast-forward), then remove the worktree and the branch.
 - Don't push unless the operator asks.
 
+## Releases
+
+- `__version__` in `hil` follows semantic versioning. The CLI, the exit
+  codes 0/1/2/3 and the existing JSON keys are the contract: breaking them
+  is a major bump, new commands/options/keys a minor, fixes a patch.
+- To release: bump `__version__` in its own commit (`chore(release): vX.Y.Z`),
+  merge, then tag that commit with an annotated tag `vX.Y.Z` whose message
+  lists the user-visible changes, and push the tag. Only the operator decides
+  to release.
+- `version_string()` adds `git describe` to the release; boot/uboot/series
+  JSON and action-log lines record it as `hil_version` (append new keys at
+  the end, never reorder existing ones).
+
 ## Commit style
 
 - Conventional Commits with a scope: `feat(hil): …`, `fix(hil): …`,
