@@ -275,10 +275,16 @@ def now_iso() -> str:
 # Every state-changing command leaves a "start" and an "end" line in
 # <state>/actions.jsonl, so a power-off at 3 a.m. can be traced afterwards.
 
-def is_recorded(args) -> bool:
-    if args.cmd == "power":
-        return args.action in ("on", "off", "cycle")
-    return args.cmd in ("boot", "uboot", "console", "hold")
+def _always(args) -> bool:
+    return True
+
+
+def _never(args) -> bool:
+    return False
+
+
+def _power_changes_state(args) -> bool:
+    return args.action in ("on", "off", "cycle")
 
 
 def current_user() -> str:
@@ -1625,7 +1631,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-b", "--bench", help="bench name (default: HIL_BENCH or default_bench)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # Each subcommand names its handler, whether it runs against a bench
+    # (handler(args, name, bench)) or the whole config (handler(args, cfg)),
+    # and whether a call changes state and so goes into the action log.
+    ap.set_defaults(needs_bench=True, recorded=_never)
+
     p = sub.add_parser("power", help="relay control and energy reading")
+    p.set_defaults(func=cmd_power, recorded=_power_changes_state)
     p.add_argument("action", choices=["status", "on", "off", "cycle", "watch"])
     p.add_argument("--off-seconds", type=float)
     p.add_argument("--max-on", type=float, metavar="S",
@@ -1635,6 +1647,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--csv", help="watch: also write samples to this CSV file")
 
     p = sub.add_parser("boot", help="(power-cycle and) assert boot stages on the UART")
+    p.set_defaults(func=cmd_boot, recorded=_always)
     p.add_argument("--no-cycle", action="store_true", help="watch a boot you trigger yourself")
     p.add_argument("--repeat", type=int, default=1,
                    help="boot N times and report per-stage min/median/max/stdev")
@@ -1649,6 +1662,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("uboot", help="stop autoboot and inspect/repair the U-Boot env")
+    p.set_defaults(func=cmd_uboot, recorded=_always)
     p.add_argument("action", choices=["env", "slot", "reset-counters", "run", "shell"])
     p.add_argument("slot", nargs="?", help="A or B (for 'slot')")
     p.add_argument("-c", "--cmd", dest="commands", action="append", default=[],
@@ -1668,20 +1682,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("wait-ssh", help="wait until the target's sshd answers")
+    p.set_defaults(func=cmd_wait_ssh)
     p.add_argument("--host")
     p.add_argument("--timeout", type=float)
 
     p = sub.add_parser("console", help="interactive tio session with logging")
+    p.set_defaults(func=cmd_console, recorded=_always)
     p.add_argument("--log-dir")
 
-    sub.add_parser("lock", help="show who holds the bench lock (read-only, JSON)")
+    p = sub.add_parser("lock", help="show who holds the bench lock (read-only, JSON)")
+    p.set_defaults(func=cmd_lock)
 
     p = sub.add_parser("hold", help="run a command under the bench lock (flash, install, test script)")
+    p.set_defaults(func=cmd_hold, recorded=_always)
     p.add_argument("command", nargs=argparse.REMAINDER, help="-- CMD [ARGS...]")
 
-    sub.add_parser("benches", help="list configured benches")
+    p = sub.add_parser("benches", help="list configured benches")
+    p.set_defaults(func=cmd_benches, needs_bench=False)
 
     p = sub.add_parser("mcp", help="serve a small MCP tool set on a Unix socket (agent policy)")
+    p.set_defaults(func=cmd_mcp, needs_bench=False)
     p.add_argument("--socket", required=True, help="Unix socket path to listen on")
     p.add_argument("--socket-mode", default="600", help="octal permissions of the socket (600 or 660)")
     return ap
@@ -1694,19 +1714,15 @@ def dispatch(args, argv: list[str], cfg: dict | None = None, caller: str | None 
         if cfg is None:
             cfg = load_config()
             apply_paths(cfg)
-        if args.cmd == "benches":
-            return cmd_benches(args, cfg)
-        if args.cmd == "mcp":
-            if caller == "agent":
+        if not args.needs_bench:
+            if args.func is cmd_mcp and caller == "agent":
                 raise BenchError("mcp can't be started from an MCP call")
-            return cmd_mcp(args, cfg)
+            return args.func(args, cfg)
         name, bench = get_bench(cfg, args.bench)
         args.caller = "agent" if caller == "agent" else caller_policy(cfg, bench)
-        fn = {"power": cmd_power, "boot": cmd_boot, "uboot": cmd_uboot, "wait-ssh": cmd_wait_ssh,
-              "console": cmd_console, "hold": cmd_hold, "lock": cmd_lock}[args.cmd]
-        if is_recorded(args):
-            return run_recorded(name, args, lambda: fn(args, name, bench), argv)
-        return fn(args, name, bench)
+        if args.recorded(args):
+            return run_recorded(name, args, lambda: args.func(args, name, bench), argv)
+        return args.func(args, name, bench)
     except HilError as e:
         print(f"hil: {e}", file=sys.stderr)
         return e.exit_code

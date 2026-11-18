@@ -36,7 +36,8 @@ template. IPs, serial IDs and credential paths stay out of the repo.
 ## Architecture (all in `hil`)
 
 - **Config → bench:** `load_config` + `get_bench` select a bench from
-  `-b`, `HIL_BENCH`, or `default_bench`. Every `cmd_*` takes `(args, name, bench)`.
+  `-b`, `HIL_BENCH`, or `default_bench`. Bench commands take `(args, name, bench)`;
+  `benches` and `mcp` take `(args, cfg)` (`needs_bench=False`).
   All locations live in one `Paths` object, `PATHS` (state, lock dir, log
   dir, default plug creds). `apply_paths` sets the fields the config's
   `[paths]` gives (service-user setup, `docs/service-user.md`) after
@@ -106,7 +107,10 @@ template. IPs, serial IDs and credential paths stay out of the repo.
   `.json` summary to `--log-dir` or `~/.local/state/hil-bench/logs/`.
   Grep the raw logs with `grep -a`.
 - **Entry points:** `build_parser()` + `dispatch(args, argv, cfg, caller)`;
-  `main()` is `dispatch(build_parser().parse_args(argv), argv)`.
+  `main()` is `dispatch(build_parser().parse_args(argv), argv)`. Each
+  subparser's `set_defaults` names its handler (`func`), `needs_bench`, and
+  `recorded(args)` (does this call go into the action log). A new command
+  is one subparser block, plus an MCP tool only if agents need it.
 - **MCP:** `hil mcp` (`McpServer`) maps each tool in `MCP_TOOLS` to a fixed
   argv (`mcp_argv`, values as `--opt=VALUE`) and runs it through
   `dispatch(..., cfg=<loaded at start>, caller="agent")` with stdout and

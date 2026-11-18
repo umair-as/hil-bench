@@ -29,6 +29,17 @@ class ActionLogTests(HilTestCase):
         for k in ("ts", "user", "pid"):
             self.assertIn(k, recs[0])
 
+    def test_exactly_the_state_changing_commands_are_recorded(self):
+        parse = hil.build_parser().parse_args
+        recorded = {"power on", "power off", "power cycle", "boot", "uboot env", "console", "hold -- true"}
+        for cmd in ("power status", "power watch", "power on", "power off", "power cycle", "boot",
+                    "uboot env", "wait-ssh", "console", "lock", "hold -- true"):
+            args = parse(cmd.split())
+            self.assertEqual(args.recorded(args), cmd in recorded, cmd)
+            self.assertTrue(args.needs_bench, cmd)
+        for cmd in ("benches", "mcp --socket x"):
+            self.assertFalse(parse(cmd.split()).needs_bench, cmd)
+
     def test_read_only_commands_not_logged(self):
         self.run_main("power", "status")
         self.run_main("benches")
