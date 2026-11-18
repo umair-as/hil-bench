@@ -85,6 +85,40 @@ class BootCommandTests(HilTestCase):
         log = (self.tmp / "logs" / js[0].name.replace(".json", ".log")).read_bytes()
         self.assertIn(b"login: ", log)
 
+    def test_bench_error_still_writes_json(self):
+        plug = FakePlug()
+        plug.unreachable = True
+        self.use_fakes(FakeSerial(), plug)
+        with self.assertRaises(hil.BenchError):
+            hil.cmd_boot(ns(log_dir=str(self.tmp / "logs"), timeout=1), "t", self.bench())
+        logs = sorted((self.tmp / "logs").glob("t-boot-*"))
+        self.assertEqual([p.suffix for p in logs], [".json", ".log"])
+        data = json.loads(logs[0].read_text())
+        self.assertEqual(data["result"], "ERROR")
+        self.assertIn("unreachable", data["error"])
+
+    def test_bench_error_mid_series_writes_run_json(self):
+        plug = FakePlug()
+        ser = FakeSerial()
+        self.use_fakes(ser, plug)
+        orig, n = plug.power, {"on": 0}
+
+        def power(action=None):
+            if action == "On":
+                n["on"] += 1
+                if n["on"] == 2:
+                    raise hil.BenchError("tasmota fake unreachable")
+                s = orig(action)
+                ser.feed(LINUX_BOOT)
+                return s
+            return orig(action)
+        plug.power = power
+        rc = hil.cmd_boot(ns(log_dir=str(self.tmp / "logs"), timeout=1, repeat=3), "t", self.bench())
+        self.assertEqual(rc, 2)
+        r2 = list((self.tmp / "logs").glob("t-boot-r02-*.json"))
+        self.assertEqual(len(r2), 1)
+        self.assertEqual(json.loads(r2[0].read_text())["result"], "ERROR")
+
     def test_boot_fail_exit_1(self):
         ser = FakeSerial()
         self.use_fakes(ser)
