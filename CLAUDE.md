@@ -142,9 +142,10 @@ the serial port before running them.
   the argparse definitions in `main()`.
 - `docs/bench-lock.md`: the lock protocol other tools follow. Keep it in
   sync with `bench_lock`, `inherited_lock` and `flock_holders`.
-- `docs/nous-a8t.md`: notes on the bench smart plug (Tasmota settings applied,
-  open items, the plug features `hil` uses and the Backlog/Delay finding,
-  features it doesn't use yet).
+- `docs/nous-a8t.md`: generic notes on the bench smart plug (capabilities,
+  calibration, recommended bench settings, the plug features `hil` uses and
+  the Backlog/Delay finding, features it doesn't use yet). Keep it generic:
+  no as-found state of a particular unit (addresses, readings, dates).
 
 Commit messages use Conventional Commits with a scope, e.g.
 `feat(hil): …`, `docs(nous-a8t): …`.
