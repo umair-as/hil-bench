@@ -113,8 +113,8 @@ itself still runs.
 | `env` | print the configured variables (below), or the whole `printenv` if none are configured |
 | `slot A\|B` | `ab = "rauc"` only: `BOOT_ORDER="<slot> <other>"`, both counters to `--attempts` (3), `saveenv` |
 | `reset-counters` | `ab = "rauc"` only: both counters to `--attempts`, `saveenv`, e.g. after an "all slots exhausted" halt |
-| `run -c CMD [-c CMD …]` | arbitrary commands in order; stops at the first non-zero `$?` |
-| `shell` | stop autoboot, then hand the prompt to `tio` |
+| `run -c CMD [-c CMD …]` | arbitrary commands in order; stops at the first non-zero `$?` (agents: allowlist only) |
+| `shell` | stop autoboot, then hand the prompt to `tio` (refused for agents) |
 
 `--then boot` (default) runs `boot` and watches the console until login, so a
 repair is checked by a real boot in the same run. Stages the console already
@@ -132,8 +132,15 @@ again, required or not. `--then stay` leaves the board at the prompt, and
 - **Typing safety:** each command is typed without Enter and its echo checked
   first. A garbled echo gets Ctrl-C and one retry, and is never executed, so a
   dropped byte can't turn into a different `setenv`/`saveenv`.
-- **Destructive commands** (`mmc write/erase`, `env default`, `fatwrite`,
-  `ums`, `dfu`, …) are refused without `--allow-destructive`.
+- **Destructive commands** are refused without `--allow-destructive`:
+  card/flash writes and erases (`mmc write/erase`, `sf`, `nand`, `gpt write`,
+  `fatwrite`, `ums`, `dfu`, …), env writes (`saveenv`, `env save/default/
+  erase/import`, `editenv`), changes to `bootdelay`/`bootcmd` (a saved
+  `bootdelay -2` locks `hil uboot` out for good), `fuse` (OTP), memory and
+  bus pokes (`mw`, `nm`, `mm`, `i2c mw/write`), `run`, and anything with `$`.
+  A text denylist can't see through hush variables, hence the last two.
+  `slot` and `reset-counters` run their own fixed `setenv`/`saveenv`
+  sequence and don't need the flag.
 - If a command fails, the board is left at the U-Boot prompt and the error
   says so; `hil power cycle` or `hil boot` brings it back.
 - **A/B scheme is opt-in.** `[benches.X.uboot] ab = "rauc"` enables `slot`
@@ -144,6 +151,33 @@ again, required or not. `--then stay` leaves the board at the prompt, and
 - `hil uboot` only applies to boards that boot through U-Boot. A board with a
   different bootloader (e.g. UEFI) only uses `power`, `boot`,
   `wait-ssh` and `console`.
+
+## Caller policy (human or agent)
+
+A caller is either `human` (default) or `agent`. The policy comes from the
+config and the environment the operator sets, never from a command-line
+flag: `HIL_CALLER`, a top-level `caller = "agent"` in `benches.toml`, or
+`caller = "agent"` in one bench. If any of them says `agent`, the caller is
+an agent, and an unknown value also counts as `agent`. So the environment
+can tighten the config but never loosen it.
+
+For an agent caller:
+
+- `--allow-destructive`, `uboot shell`, `console` and `--stop-string` are
+  refused. Stop strings still work: `hil` types them from the autoboot
+  prompt or `[uboot] stop_string`.
+- `uboot run -c CMD` runs only commands that match the bench's allowlist,
+  `[benches.X.uboot] allow = ["printenv", "printenv *", "setenv BOOT_ORDER *"]`
+  (shell-style globs over the whole command, spaces collapsed). Without an
+  allowlist, `run` is refused. Commands with hush syntax (`; & | $` quotes
+  `\` `` ` `` `#` `{}` `<>`) are refused before matching, and the denylist
+  above still applies to anything the allowlist lets through.
+- `env`, `slot` and `reset-counters` stay available.
+- Every action log line carries the caller.
+
+On its own this is a promise, not enforcement: an agent running as the same
+user can edit the config or call the plug directly. Run `hil` as a separate
+service user (below) to make it binding.
 
 ## Sharing the bench
 

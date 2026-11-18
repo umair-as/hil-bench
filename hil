@@ -26,6 +26,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import fnmatch
 import http.client
 import json
 import math
@@ -134,6 +135,21 @@ def inherited_lock(path: Path) -> int | None:
     return fd
 
 
+CALLERS = ("human", "agent")
+
+
+def caller_policy(cfg: dict, bench: dict) -> str:
+    """'human' or 'agent', from HIL_CALLER, top-level `caller` and the
+    bench's `caller`. Any source saying 'agent' wins, an unknown value
+    counts as 'agent', and nothing set means 'human'. So the environment
+    can only tighten what the config says, never loosen it."""
+    sources = [os.environ.get("HIL_CALLER"), cfg.get("caller"), bench.get("caller")]
+    given = [v for v in sources if v is not None]
+    if any(v not in CALLERS or v == "agent" for v in given):
+        return "agent"
+    return "human"
+
+
 @contextlib.contextmanager
 def bench_lock(name: str, what: str):
     """Exclusive per-bench lock so two projects never cycle the same board.
@@ -196,7 +212,8 @@ def append_action(record: dict) -> None:
 
 def run_recorded(name: str, args, fn) -> int:
     """Run fn() between a start and an end record. No start record, no action."""
-    rec = {"pid": os.getpid(), "user": current_user(), "bench": name, "argv": sys.argv[1:]}
+    rec = {"pid": os.getpid(), "user": current_user(), "caller": getattr(args, "caller", None),
+           "bench": name, "argv": sys.argv[1:]}
     append_action({"ts": now_iso(), "event": "start"} | rec)
     rc, err = None, None
     try:
@@ -723,16 +740,46 @@ AUTOBOOT_RX = re.compile(r"[Tt]ype '([^']+)'[^\n]*(?:stop|autoboot)|Hit any key 
 # Extend per bench with [uboot] too_late_patterns (e.g. a bootcmd's own log tag).
 TOO_LATE_DEFAULT = [r"## Loading kernel", r"Starting kernel", r"Booting Linux"]
 UBOOT_PROMPT = r"(?:U-Boot> |=> )"
-# Commands that can destroy a card or the whole env; need --allow-destructive.
+# Commands that can destroy a card or the env, lock the board out of hil
+# (bootdelay/bootcmd + saveenv), burn OTP, or poke memory and buses; they
+# need --allow-destructive. A denylist on command text can't see through
+# hush variables or `run`, so both count as destructive too.
 DESTRUCTIVE_RX = re.compile(
-    r"\b(?:mmc\s+(?:write|erase|swrite|part|partconf|bootbus|rst)|erase|env\s+default|gpt\s+write"
-    r"|fatwrite|ext4write|fatrm|sf\s+(?:erase|write|update)|ums|dfu|fastboot|nand\s+(?:erase|write))\b")
+    r"\b(?:mmc\s+(?:write|erase|swrite|part|partconf|bootbus|rst)|erase|gpt\s+write"
+    r"|fatwrite|ext4write|fatrm|sf\s+(?:erase|write|update)|ums|dfu|fastboot|nand\s+(?:erase|write)"
+    r"|saveenv|editenv|env\s+(?:default|save|erase|edit|import)"
+    r"|(?:setenv|setexpr|env\s+(?:set|delete))\s+(?:-f\s+)?(?:bootdelay|bootcmd)\b"
+    r"|fuse|(?:mw|nm|mm)(?:\.[bwlq])?|i2c\s+(?:mw|nm|mm|write)|run)\b"
+    r"|\$")
+# Hush syntax that chains, expands or quotes. Refused outright for agents,
+# before the allowlist is matched, so "setenv BOOT_*" can't smuggle a ";".
+SHELL_SYNTAX_RX = re.compile(r"[;&|$'\"\\`#{}<>\n\r]")
 # RAUC's U-Boot boot-selection convention; only used when [uboot] ab = "rauc".
 RAUC_VARS = ["BOOT_ORDER", "BOOT_A_LEFT", "BOOT_B_LEFT"]
 
 
 class UbootError(Exception):
     """The target did not reach / cooperate at the U-Boot shell (exit 1)."""
+
+
+def is_destructive(cmd: str) -> bool:
+    return bool(DESTRUCTIVE_RX.search(cmd))
+
+
+def agent_command_refusal(cmd: str, allow: list[str]) -> str | None:
+    """Why an agent may not run cmd at the U-Boot prompt, or None if it may.
+    The command must be plain words, match a bench `[uboot] allow` glob, and
+    not be destructive (the denylist stays as a second check)."""
+    if SHELL_SYNTAX_RX.search(cmd):
+        return f"{cmd!r} uses shell syntax (; & | $ quotes \\ ` # {{}} <>)"
+    words = " ".join(cmd.split())
+    if not allow:
+        return "no [uboot] allow list for this bench, so agents can't use 'run'"
+    if not any(fnmatch.fnmatchcase(words, pat) for pat in allow):
+        return f"{words!r} is not in the bench's [uboot] allow list"
+    if is_destructive(words):
+        return f"{words!r} is destructive"
+    return None
 
 
 def uboot_interrupt(con: Console, bench: dict, stop: str | None, timeout: float) -> dict:
@@ -808,18 +855,42 @@ def read_env(con: Console, names: list[str]) -> dict:
     return env
 
 
+def uboot_policy_check(args, bench) -> None:
+    """Refuse what the caller may not do before anything touches the bench."""
+    conf = bench.get("uboot") or {}
+    if not 1 <= args.attempts <= 99:
+        raise BenchError("--attempts must be between 1 and 99")
+    if args.caller == "agent":
+        if args.allow_destructive:
+            raise BenchError("caller policy is 'agent': --allow-destructive is refused")
+        if args.action == "shell":
+            raise BenchError("caller policy is 'agent': 'uboot shell' (raw console) is refused")
+        if args.stop_string:
+            raise BenchError("caller policy is 'agent': --stop-string is refused "
+                             "(set [uboot] stop_string in the bench config)")
+        if args.action == "run":
+            allow = conf.get("allow", [])
+            if not (isinstance(allow, list) and all(isinstance(a, str) for a in allow)):
+                raise BenchError("[uboot] allow must be a list of glob patterns")
+            for c in args.commands:
+                why = agent_command_refusal(c, allow)
+                if why:
+                    raise BenchError(f"caller policy is 'agent': {why}")
+    elif args.action == "run":
+        bad = [c for c in args.commands if is_destructive(c)]
+        if bad and not args.allow_destructive:
+            raise BenchError(f"refusing destructive command(s) {bad} without --allow-destructive")
+
+
 def cmd_uboot(args, name, bench) -> int:
     ab = (bench.get("uboot") or {}).get("ab")
     if args.action in ("slot", "reset-counters") and ab != "rauc":
         raise BenchError(f"'{args.action}' needs an A/B scheme: set [benches.{name}.uboot] ab = \"rauc\"")
     if args.action == "slot" and args.slot not in ("A", "B"):
         raise BenchError("slot must be A or B")
-    if args.action == "run":
-        if not args.commands:
-            raise BenchError("run needs at least one command")
-        bad = [c for c in args.commands if DESTRUCTIVE_RX.search(c)]
-        if bad and not args.allow_destructive:
-            raise BenchError(f"refusing destructive command(s) {bad} without --allow-destructive")
+    if args.action == "run" and not args.commands:
+        raise BenchError("run needs at least one command")
+    uboot_policy_check(args, bench)
     then = "console" if args.action == "shell" else args.then
     attempts = str(args.attempts)
 
@@ -934,6 +1005,8 @@ def cmd_wait_ssh(args, name, bench) -> int:
 
 
 def cmd_console(args, name, bench) -> int:
+    if args.caller == "agent":
+        raise BenchError("caller policy is 'agent': the raw console (tio) is refused")
     tio = shutil.which("tio")
     if not tio:
         raise BenchError("tio not installed")
@@ -1029,7 +1102,8 @@ def main() -> int:
     p.add_argument("--attempts", type=int, default=3,
                    help="BOOT_x_LEFT value for slot/reset-counters (ab = \"rauc\" benches)")
     p.add_argument("--stop-string", help="override the autoboot stop string (auto-detected from the prompt)")
-    p.add_argument("--allow-destructive", action="store_true", help="permit erase/write/env-default commands")
+    p.add_argument("--allow-destructive", action="store_true",
+                   help="permit erase/write/saveenv/env-default commands (refused for agent callers)")
     p.add_argument("--no-cycle", action="store_true", help="catch a reset you trigger yourself")
     p.add_argument("--prompt-timeout", type=float, default=60, help="seconds to wait for the autoboot prompt")
     p.add_argument("--cmd-timeout", type=float, default=15)
@@ -1057,6 +1131,7 @@ def main() -> int:
         if args.cmd == "benches":
             return cmd_benches(args, cfg)
         name, bench = get_bench(cfg, args.bench)
+        args.caller = caller_policy(cfg, bench)
         fn = {"power": cmd_power, "boot": cmd_boot, "uboot": cmd_uboot, "wait-ssh": cmd_wait_ssh,
               "console": cmd_console, "hold": cmd_hold, "lock": cmd_lock}[args.cmd]
         if is_recorded(args):

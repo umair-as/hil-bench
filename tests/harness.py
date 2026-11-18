@@ -60,6 +60,10 @@ def _no_serial(*a, **kw):
     raise AssertionError("test tried to open a real serial port")
 
 
+def _no_exec(*a, **kw):
+    raise AssertionError(f"test tried to replace the process (exec {a[:1]})")
+
+
 # ----------------------------------------------------------------- fakes
 
 class FakeSerial:
@@ -243,6 +247,8 @@ class HilTestCase(unittest.TestCase):
             mock.patch.object(hil, "STATE", self.tmp / "state" / "hil-bench"),
             mock.patch.object(socket.socket, "connect", _guarded_connect),
             mock.patch("sys.stdout", io.StringIO()),
+            mock.patch("os.execv", _no_exec),
+            mock.patch("os.execvp", _no_exec),
         ):
             p.start()
             self.addCleanup(p.stop)
@@ -293,5 +299,5 @@ def ns(**kw):
     base = dict(no_cycle=False, repeat=1, settle=0.0, power_interval=None, timeout=None,
                 log_dir=None, json=True, slot=None, commands=[], then="stay", attempts=3,
                 stop_string=None, allow_destructive=False, prompt_timeout=5, cmd_timeout=3,
-                off_seconds=None, interval=1.0, duration=None, csv=None)
+                off_seconds=None, interval=1.0, duration=None, csv=None, caller="human")
     return argparse.Namespace(**(base | kw))

@@ -60,8 +60,8 @@ template. IPs, serial IDs and credential paths stay out of the repo.
   string auto-detected) and treats a kernel load seen before any prompt as a
   non-interruptible lockdown. `uboot_cmd` types each command, checks its echo
   before pressing Enter (Ctrl-C and one retry on a mismatch), and
-  `uboot_rc` reads `$?`. `DESTRUCTIVE_RX` blocks erase/write/env-default
-  commands without `--allow-destructive`. `--then boot` re-judges the boot
+  `uboot_rc` reads `$?`. `DESTRUCTIVE_RX` blocks erase/write/saveenv/
+  bootdelay/bootcmd/fuse/mw/run/`$` commands without `--allow-destructive`. `--then boot` re-judges the boot
   after the repair in the same run.
 - **Measurement:** `Tasmota.energy` reads the meter (`Status 8`).
   `PowerSampler` polls it in a thread during `boot --power-interval`, timed
@@ -72,6 +72,14 @@ template. IPs, serial IDs and credential paths stay out of the repo.
   the runs to per-stage min/median/max/stdev, and a bench error mid-series
   still writes a partial series file. `power watch` is read-only and
   takes no lock.
+- **Caller policy:** `caller_policy` returns `human` or `agent` from
+  `HIL_CALLER` and the config's `caller` keys (any `agent` or unknown value
+  wins; never a CLI flag). `main()` stores it in `args.caller`. For agents,
+  `uboot_policy_check` refuses `--allow-destructive`, `shell` and
+  `--stop-string`, and `agent_command_refusal` allows only `[uboot] allow`
+  globs without hush syntax; `cmd_console` refuses too. Fixed actions
+  (`env`, `slot`, `reset-counters`) and hil's own typed commands aren't
+  filtered.
 - **Action log:** `main()` wraps every state-changing command in
   `run_recorded`, which appends `start`/`end` JSON lines to
   `<state>/actions.jsonl` and refuses the command if the start line can't

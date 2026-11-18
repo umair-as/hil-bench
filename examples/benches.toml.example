@@ -2,6 +2,8 @@
 # Host-local: IPs, serial IDs and credential paths never go in a project repo.
 
 default_bench = "rpi5"
+# caller = "agent"   # every caller is an agent (see README "Caller policy");
+#                    # HIL_CALLER=agent in an agent's environment does the same
 
 [benches.rpi5]
 description = "Raspberry Pi 5 on Tasmota plug"
@@ -28,6 +30,9 @@ timeout = 120
 # too_late_patterns = ['\[MYBOOT\]']   # bootcmd output proving autoboot already ran
 # ab = "rauc"                # enables `hil uboot slot` / `reset-counters`
 # env_vars = ["bootcount", "rauc_slot"]   # extra vars `hil uboot` reads
+# Commands an agent caller may pass to `hil uboot run -c` (globs over the
+# whole command). No list = agents can't use `run`.
+# allow = ["printenv", "printenv *", "setenv BOOT_ORDER *", "setenv BOOT_?_LEFT *", "mmc list"]
 
 [benches.rpi5.boot]
 timeout = 180
